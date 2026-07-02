@@ -46,9 +46,7 @@ class TestSereneDBStandardSuiteSync(VectorStoreIntegrationTests):
         engine.init_vectorstore_table(
             table, EMBEDDING_SIZE, overwrite_existing=True, id_column=_ID_COLUMN
         )
-        vs = SereneDBVectorStore.create_sync(
-            engine, self.get_embeddings(), table
-        )
+        vs = SereneDBVectorStore.create_sync(engine, self.get_embeddings(), table)
         try:
             yield vs
         finally:

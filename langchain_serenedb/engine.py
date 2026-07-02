@@ -268,9 +268,7 @@ class SereneDBEngine:
             id_column_name = id_column["name"]
 
         if overwrite_existing:
-            await self._aexecute(
-                f'DROP TABLE IF EXISTS "{schema_name}"."{table_name}"'
-            )
+            await self._aexecute(f'DROP TABLE IF EXISTS "{schema_name}"."{table_name}"')
 
         query = (
             f'CREATE TABLE "{schema_name}"."{table_name}"(\n'
@@ -425,7 +423,9 @@ class SereneDBEngine:
         table_name = self._escape_identifier(table_name)
         await self._aexecute(f'DROP TABLE IF EXISTS "{schema_name}"."{table_name}";')
 
-    async def adrop_table(self, table_name: str, *, schema_name: str = "public") -> None:
+    async def adrop_table(
+        self, table_name: str, *, schema_name: str = "public"
+    ) -> None:
         await self._run_as_async(
             self._adrop_table(table_name=table_name, schema_name=schema_name)
         )

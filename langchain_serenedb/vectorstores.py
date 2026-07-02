@@ -17,7 +17,12 @@ from langchain_core.vectorstores import VectorStore
 from .async_vectorstore import AsyncSereneDBVectorStore
 from .engine import SereneDBEngine
 from .hybrid_search_config import HybridSearchConfig
-from .indexes import DEFAULT_DISTANCE_STRATEGY, BaseIndex, DistanceStrategy, QueryOptions
+from .indexes import (
+    DEFAULT_DISTANCE_STRATEGY,
+    BaseIndex,
+    DistanceStrategy,
+    QueryOptions,
+)
 
 
 class SereneDBVectorStore(VectorStore):
@@ -25,9 +30,13 @@ class SereneDBVectorStore(VectorStore):
 
     __create_key = object()
 
-    def __init__(self, key: object, engine: SereneDBEngine, vs: AsyncSereneDBVectorStore) -> None:
+    def __init__(
+        self, key: object, engine: SereneDBEngine, vs: AsyncSereneDBVectorStore
+    ) -> None:
         if key != SereneDBVectorStore.__create_key:
-            raise Exception("Only create class through 'create' or 'create_sync' methods!")
+            raise Exception(
+                "Only create class through 'create' or 'create_sync' methods!"
+            )
         self._engine = engine
         self.__vs = vs
 
@@ -117,24 +126,38 @@ class SereneDBVectorStore(VectorStore):
     # -- search ----------------------------------------------------------------------
 
     def similarity_search(
-        self, query: str, k: Optional[int] = None, filter: Optional[dict] = None, **kwargs: Any
+        self,
+        query: str,
+        k: Optional[int] = None,
+        filter: Optional[dict] = None,
+        **kwargs: Any,
     ) -> list[Document]:
         return self._engine._run_as_sync(
             self.__vs.asimilarity_search(query, k=k, filter=filter, **kwargs)
         )
 
     def similarity_search_with_score(
-        self, query: str, k: Optional[int] = None, filter: Optional[dict] = None, **kwargs: Any
+        self,
+        query: str,
+        k: Optional[int] = None,
+        filter: Optional[dict] = None,
+        **kwargs: Any,
     ) -> list[tuple[Document, float]]:
         return self._engine._run_as_sync(
             self.__vs.asimilarity_search_with_score(query, k=k, filter=filter, **kwargs)
         )
 
     def similarity_search_by_vector(
-        self, embedding: list[float], k: Optional[int] = None, filter: Optional[dict] = None, **kwargs: Any
+        self,
+        embedding: list[float],
+        k: Optional[int] = None,
+        filter: Optional[dict] = None,
+        **kwargs: Any,
     ) -> list[Document]:
         return self._engine._run_as_sync(
-            self.__vs.asimilarity_search_by_vector(embedding, k=k, filter=filter, **kwargs)
+            self.__vs.asimilarity_search_by_vector(
+                embedding, k=k, filter=filter, **kwargs
+            )
         )
 
     def max_marginal_relevance_search(
@@ -148,7 +171,12 @@ class SereneDBVectorStore(VectorStore):
     ) -> list[Document]:
         return self._engine._run_as_sync(
             self.__vs.amax_marginal_relevance_search(
-                query, k=k, fetch_k=fetch_k, lambda_mult=lambda_mult, filter=filter, **kwargs
+                query,
+                k=k,
+                fetch_k=fetch_k,
+                lambda_mult=lambda_mult,
+                filter=filter,
+                **kwargs,
             )
         )
 
@@ -158,7 +186,11 @@ class SereneDBVectorStore(VectorStore):
     # -- index management ------------------------------------------------------------
 
     def apply_vector_index(
-        self, index: BaseIndex, name: Optional[str] = None, *, concurrently: bool = False
+        self,
+        index: BaseIndex,
+        name: Optional[str] = None,
+        *,
+        concurrently: bool = False,
     ) -> None:
         return self._engine._run_as_sync(
             self.__vs.aapply_vector_index(index, name=name, concurrently=concurrently)

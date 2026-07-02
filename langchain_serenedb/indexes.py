@@ -183,9 +183,7 @@ def build_dictionary_ddl(
 ) -> str:
     """CREATE TEXT SEARCH DICTIONARY statement (for the full-text/hybrid analyzer)."""
     ine = "IF NOT EXISTS " if if_not_exists else ""
-    return (
-        f"CREATE TEXT SEARCH DICTIONARY {ine}{_quote_ident(dictionary_name)} ({options});"
-    )
+    return f"CREATE TEXT SEARCH DICTIONARY {ine}{_quote_ident(dictionary_name)} ({options});"
 
 
 def build_vector_index_ddl(

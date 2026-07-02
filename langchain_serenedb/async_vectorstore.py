@@ -20,7 +20,7 @@ from __future__ import annotations
 import datetime
 import json
 import uuid
-from typing import Any, Iterable, Optional, Sequence, Union
+from typing import Any, Iterable, Optional, Sequence
 
 import numpy as np
 from langchain_core.documents import Document
@@ -70,6 +70,7 @@ PYTHON_TO_SDB_TYPE_MAP = {
     datetime.datetime: "TIMESTAMP",
     datetime.time: "TIME",
 }
+
 
 class AsyncSereneDBVectorStore(VectorStore):
     """Async vector store for SereneDB. Construct via :meth:`create`."""
@@ -318,9 +319,7 @@ class AsyncSereneDBVectorStore(VectorStore):
             await self.engine._aexecute(insert_stmt + values_stmt + upsert_stmt, values)
 
         # Publish the writes to the inverted index (eventual consistency).
-        await self.engine._arefresh_table(
-            self.table_name, schema_name=self.schema_name
-        )
+        await self.engine._arefresh_table(self.table_name, schema_name=self.schema_name)
         return ids
 
     async def aadd_texts(
@@ -373,9 +372,7 @@ class AsyncSereneDBVectorStore(VectorStore):
             f'DELETE FROM "{self.schema_name}"."{self.table_name}" WHERE {where_clause}'
         )
         await self.engine._aexecute(query, param_dict)
-        await self.engine._arefresh_table(
-            self.table_name, schema_name=self.schema_name
-        )
+        await self.engine._arefresh_table(self.table_name, schema_name=self.schema_name)
         return True
 
     # -- search ----------------------------------------------------------------------
@@ -395,7 +392,9 @@ class AsyncSereneDBVectorStore(VectorStore):
         out = []
         for row in rows:
             raw_meta = (
-                row.get(self.metadata_json_column) if self.metadata_json_column else None
+                row.get(self.metadata_json_column)
+                if self.metadata_json_column
+                else None
             )
             if isinstance(raw_meta, str):
                 metadata = json.loads(raw_meta) if raw_meta else {}
@@ -447,7 +446,9 @@ class AsyncSereneDBVectorStore(VectorStore):
 
         prelude = None
         if self.index_query_options:
-            prelude = [f"SET LOCAL {opt};" for opt in self.index_query_options.to_parameter()]
+            prelude = [
+                f"SET LOCAL {opt};" for opt in self.index_query_options.to_parameter()
+            ]
         return await self._aquery(query, params, prelude=prelude)
 
     async def _asparse_query(
@@ -497,7 +498,9 @@ class AsyncSereneDBVectorStore(VectorStore):
         dense_limit = (
             hybrid_search_config.primary_top_k if hybrid_search_config else final_k
         )
-        dense_rows = await self._adense_query(embedding, limit=dense_limit, filter=filter)
+        dense_rows = await self._adense_query(
+            embedding, limit=dense_limit, filter=filter
+        )
 
         fts_query = ""
         if hybrid_search_config:
@@ -594,8 +597,15 @@ class AsyncSereneDBVectorStore(VectorStore):
         filter: Optional[dict] = None,
         **kwargs: Any,
     ) -> list[Document]:
-        docs_and_scores = await self.amax_marginal_relevance_search_with_score_by_vector(
-            embedding, k=k, fetch_k=fetch_k, lambda_mult=lambda_mult, filter=filter, **kwargs
+        docs_and_scores = (
+            await self.amax_marginal_relevance_search_with_score_by_vector(
+                embedding,
+                k=k,
+                fetch_k=fetch_k,
+                lambda_mult=lambda_mult,
+                filter=filter,
+                **kwargs,
+            )
         )
         return [doc for doc, _ in docs_and_scores]
 
@@ -648,9 +658,7 @@ class AsyncSereneDBVectorStore(VectorStore):
 
     # -- index management ------------------------------------------------------------
 
-    async def _acreate_text_search_dictionary(
-        self, config: HybridSearchConfig
-    ) -> None:
+    async def _acreate_text_search_dictionary(self, config: HybridSearchConfig) -> None:
         """Create the text search dictionary used to analyze the content column."""
         await self.engine._aexecute(
             build_dictionary_ddl(config.dictionary_name, config.dictionary_options)
@@ -692,7 +700,9 @@ class AsyncSereneDBVectorStore(VectorStore):
                 hnsw_options=hnsw_options,
             )
         else:
-            index_name = name or index.name or (self.table_name + DEFAULT_INDEX_NAME_SUFFIX)
+            index_name = (
+                name or index.name or (self.table_name + DEFAULT_INDEX_NAME_SUFFIX)
+            )
             index.name = index_name
             stmt = build_vector_index_ddl(
                 schema_name=self.schema_name,
@@ -703,9 +713,7 @@ class AsyncSereneDBVectorStore(VectorStore):
             )
         await self.engine._aexecute(stmt)
         # Publish existing rows so the new index is immediately searchable.
-        await self.engine._arefresh_table(
-            self.table_name, schema_name=self.schema_name
-        )
+        await self.engine._arefresh_table(self.table_name, schema_name=self.schema_name)
 
     async def aapply_hybrid_search_index(self, concurrently: bool = False) -> None:
         """Create the combined inverted index for hybrid search."""
@@ -764,7 +772,9 @@ class AsyncSereneDBVectorStore(VectorStore):
             field.isidentifier()
             or all(part.isidentifier() for part in field.split("."))
         ):
-            raise ValueError(f"Invalid field name: {field}. Expected a valid identifier.")
+            raise ValueError(
+                f"Invalid field name: {field}. Expected a valid identifier."
+            )
 
         if isinstance(value, dict):
             if len(value) != 1:
@@ -799,9 +809,7 @@ class AsyncSereneDBVectorStore(VectorStore):
         if "." in field_selector:
             n_dots = field_selector.count(".")
             field_selector = "->".join(
-                part
-                if ind == 0
-                else f"{'>' if ind == n_dots else ''}'{part}'"
+                part if ind == 0 else f"{'>' if ind == n_dots else ''}'{part}'"
                 for ind, part in enumerate(field_selector.split("."))
             )
             value_type = (
@@ -826,7 +834,9 @@ class AsyncSereneDBVectorStore(VectorStore):
         if operator in COMPARISONS_TO_NATIVE:
             native = COMPARISONS_TO_NATIVE[operator]
             param_name = f"{field_param_prefix}_{suffix_id}"
-            return f"{field_selector} {native} %({param_name})s", {param_name: filter_value}
+            return f"{field_selector} {native} %({param_name})s", {
+                param_name: filter_value
+            }
 
         if operator == "$between":
             low, high = filter_value
@@ -858,7 +868,9 @@ class AsyncSereneDBVectorStore(VectorStore):
         if operator in {"$like", "$ilike"}:
             param_name = f"{field_param_prefix}_{operator[1:]}_{suffix_id}"
             keyword = "LIKE" if operator == "$like" else "ILIKE"
-            return f"({field_selector} {keyword} %({param_name})s)", {param_name: filter_value}
+            return f"({field_selector} {keyword} %({param_name})s)", {
+                param_name: filter_value
+            }
 
         if operator == "$exists":
             if not isinstance(filter_value, bool):
@@ -906,7 +918,9 @@ class AsyncSereneDBVectorStore(VectorStore):
                 )
             else:  # $not
                 if isinstance(value, list):
-                    not_conditions = [self._create_filter_clause(item) for item in value]
+                    not_conditions = [
+                        self._create_filter_clause(item) for item in value
+                    ]
                     all_clauses = [c[0] for c in not_conditions]
                     params = {}
                     for c in not_conditions:

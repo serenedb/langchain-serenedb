@@ -49,7 +49,10 @@ class DetEmb(Embeddings):
         self.dim = dim
 
     def _vec(self, text: str) -> list[float]:
-        out = [hashlib.sha256(f"{i}:{text}".encode()).digest()[0] / 255.0 for i in range(self.dim)]
+        out = [
+            hashlib.sha256(f"{i}:{text}".encode()).digest()[0] / 255.0
+            for i in range(self.dim)
+        ]
         n = math.sqrt(sum(x * x for x in out)) or 1.0
         return [x / n for x in out]
 
@@ -71,7 +74,10 @@ def store():
     table = f"lc_test_{uuid.uuid4().hex[:8]}"
     engine = SereneDBEngine.from_connection_string(CONNINFO)
     engine.init_vectorstore_table(
-        table, DIM, overwrite_existing=True, metadata_columns=[Column("category", "TEXT")]
+        table,
+        DIM,
+        overwrite_existing=True,
+        metadata_columns=[Column("category", "TEXT")],
     )
     vs = SereneDBVectorStore.create_sync(
         engine,
@@ -109,7 +115,9 @@ def test_search_with_score(store):
 
 def test_metadata_column_filter(store):
     vs, _ = store
-    res = vs.similarity_search("the quick brown fox", k=5, filter={"category": "science"})
+    res = vs.similarity_search(
+        "the quick brown fox", k=5, filter={"category": "science"}
+    )
     assert [d.page_content for d in res] == ["quantum physics"]
 
 
@@ -166,7 +174,10 @@ def hybrid_store():
     table = f"lc_htest_{uuid.uuid4().hex[:8]}"
     engine = SereneDBEngine.from_connection_string(CONNINFO)
     engine.init_vectorstore_table(
-        table, DIM, overwrite_existing=True, metadata_columns=[Column("category", "TEXT")]
+        table,
+        DIM,
+        overwrite_existing=True,
+        metadata_columns=[Column("category", "TEXT")],
     )
     cfg = HybridSearchConfig(primary_top_k=10, secondary_top_k=10)
     vs = SereneDBVectorStore.create_sync(
@@ -174,7 +185,11 @@ def hybrid_store():
     )
     vs.add_texts(
         ["the quick brown fox", "a lazy brown dog", "quantum physics"],
-        metadatas=[{"category": "animal"}, {"category": "animal"}, {"category": "science"}],
+        metadatas=[
+            {"category": "animal"},
+            {"category": "animal"},
+            {"category": "science"},
+        ],
     )
     vs.apply_hybrid_search_index()
     yield vs
@@ -254,7 +269,9 @@ def test_rrf_fusion():
     cfg = HybridSearchConfig(
         primary_top_k=10, secondary_top_k=10, fusion_function=reciprocal_rank_fusion
     )
-    vs = SereneDBVectorStore.create_sync(engine, DetEmb(), table, hybrid_search_config=cfg)
+    vs = SereneDBVectorStore.create_sync(
+        engine, DetEmb(), table, hybrid_search_config=cfg
+    )
     vs.add_texts(["the quick brown fox", "a lazy brown dog", "quantum physics"])
     vs.apply_hybrid_search_index()
     try:

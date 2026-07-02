@@ -209,9 +209,9 @@ class HybridSearchConfig(ABC):
     """
 
     fts_query: str = ""
-    fusion_function: Callable[
-        [Sequence[Row], Sequence[Row], Any], Sequence[Any]
-    ] = weighted_sum_ranking
+    fusion_function: Callable[[Sequence[Row], Sequence[Row], Any], Sequence[Any]] = (
+        weighted_sum_ranking
+    )
     fusion_function_parameters: dict[str, Any] = field(default_factory=dict)
     primary_top_k: int = 4
     secondary_top_k: int = 4
