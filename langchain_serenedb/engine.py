@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from threading import Thread
-from typing import Any, Awaitable, Optional, Sequence, TypedDict, TypeVar, Union
+from typing import Any, Awaitable, Optional, Sequence, TypedDict, TypeVar, Union, cast
 
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
@@ -183,7 +183,9 @@ class SereneDBEngine:
             cur = await conn.execute(query, params)
             rows = await cur.fetchall()
             await conn.commit()
-        return rows
+        # The pool sets row_factory=dict_row, so rows are dicts; psycopg's stubs cannot
+        # see the dynamically-set factory and still type them as tuples.
+        return cast(list[dict[str, Any]], rows)
 
     async def _aexecute_autocommit(self, query: str) -> None:
         """Execute a statement that cannot run inside a transaction (e.g. VACUUM)."""

@@ -20,7 +20,7 @@ from __future__ import annotations
 import datetime
 import json
 import uuid
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Iterable, Optional, Sequence, cast
 
 import numpy as np
 from langchain_core.documents import Document
@@ -239,7 +239,9 @@ class AsyncSereneDBVectorStore(VectorStore):
             cur = await conn.execute(query, params)
             rows = await cur.fetchall()
             await conn.commit()
-        return rows
+        # The pool sets row_factory=dict_row, so rows are dicts; psycopg's stubs cannot
+        # see the dynamically-set factory and still type them as tuples.
+        return cast(list[dict[str, Any]], rows)
 
     # -- writes ----------------------------------------------------------------------
 
