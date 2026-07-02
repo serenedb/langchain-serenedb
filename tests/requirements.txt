@@ -1,0 +1,24 @@
+# Dependencies for running the test suite with a plain pip flow (e.g. a CI image that
+# does not use uv). Version constraints mirror pyproject.toml -- keep them in sync. The
+# uv-native equivalent is `uv sync --extra test`.
+#
+# This lists everything the suite imports EXCEPT langchain_serenedb itself. In the
+# docker-compose flow the package is not installed -- it is imported from the mounted
+# source, since run.sh runs `python -m pytest` from the repo root. In a plain local env,
+# install the package too (`pip install -e .`, which also pulls these via pyproject).
+
+# --- runtime deps (langchain_serenedb itself needs these) ---
+langchain-core>=1.2.11,<2.0
+psycopg[binary]>=3,<4
+psycopg-pool>=3.2.1,<4
+numpy>=1.21,<3
+
+# --- test deps ---
+langchain-tests>=1.1.5
+mypy>=1.15.0
+pytest>=8.3.4
+pytest-asyncio>=0.25.3
+pytest-cov>=6.0.0
+pytest-mock>=3.14.0
+pytest-timeout>=2.3.1
+ruff>=0.9.7

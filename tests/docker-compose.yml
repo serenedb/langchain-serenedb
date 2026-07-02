@@ -1,0 +1,71 @@
+# CI / local integration harness: bring up a SereneDB instance in one container and
+# run the test suite against it from another. The test runner (run.sh) is
+# instance-agnostic, so it neither starts nor stops the database -- it just waits for
+# the `serened` service to accept connections and then runs pytest.
+#
+# No image is built here. Both services use prebuilt images that CI agents already keep
+# cached, and the test service installs any missing Python deps at startup -- so a run
+# is just `docker compose up`, no build step:
+#
+#   SERENEDB_IMAGE=serenedb/serenedb:1.2.3 docker compose -f tests/docker-compose.yml up \
+#     --abort-on-container-exit --exit-code-from tests
+#
+# Both images are variables with defaults; override them from the environment or a .env
+# file. `--exit-code-from tests` makes the whole `up` exit with pytest's exit code.
+
+# Stable, descriptive project name. Without it Compose derives the name from this file's
+# directory ("tests"), which is too generic and collides easily on shared CI agents. For
+# parallel runs of this project on one host, override per run with `docker compose -p ...`
+# or COMPOSE_PROJECT_NAME (run_tests_docker.sh --unique does exactly that).
+name: langchain-serenedb-tests
+
+services:
+  serened:
+    image: ${SERENEDB_IMAGE:-serenedb/serenedb:latest}
+    # The image's entrypoint starts serened (listening on 7890) with its data dir at
+    # /var/lib/serenedb, so no command is needed. Data lives on the container's writable
+    # layer and is discarded on removal -- what we want for isolated test runs.
+    expose:
+      - "7890"
+    # Uncomment to also reach the instance from the host (e.g. for debugging):
+    # ports:
+    #   - "7890:7890"
+
+  tests:
+    # Reuse the SereneDB build image: CI agents keep it cached and it already carries
+    # almost all test dependencies, so there is no per-run image build. The command tops
+    # up anything missing from requirements.txt, then runs the suite.
+    image: ${BUILD_IMAGE:-serenedb/serenedb-build-ubuntu:latest}
+    depends_on:
+      - serened
+    working_dir: /app
+    volumes:
+      # Mount the checked-out repo (in CI, the job's workspace). `..` is the repo root
+      # relative to this file. The suite imports langchain_serenedb straight from here:
+      # run.sh runs `python -m pytest` from /app, so the package needs no install.
+      - ..:/app
+    environment:
+      # Point run.sh at the serened service. It polls until the DB is ready (up to
+      # SERENEDB_WAIT_TIMEOUT seconds), covering the time the image needs to boot.
+      SERENEDB_HOST: serened
+      SERENEDB_PORT: "7890"
+      SERENEDB_WAIT_TIMEOUT: "60"
+      # Force the image's interpreter; otherwise run.sh would prefer a .venv/bin/python
+      # from the mounted repo, which is built for the host.
+      PYTHON: python3
+      # Permit installing into an externally-managed (PEP 668) system Python; ignored
+      # where it does not apply.
+      PIP_BREAK_SYSTEM_PACKAGES: "1"
+      # Extra pytest args, if any -- pytest reads PYTEST_ADDOPTS natively, e.g.:
+      #   PYTEST_ADDOPTS="-k hybrid -q" docker compose -f tests/docker-compose.yml run --rm tests
+      PYTEST_ADDOPTS: ${PYTEST_ADDOPTS:-}
+    # The build image has no custom entrypoint (its default CMD is `bash`), so we do not
+    # override the entrypoint -- just install any missing deps into the image's python3
+    # here, then exec the suite.
+    command:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        python3 -m pip install --no-cache-dir -r tests/requirements.txt
+        exec tests/run.sh

@@ -1,0 +1,60 @@
+[project]
+name = "langchain-serenedb"
+version = "0.0.1"
+description = "An integration package connecting SereneDB and LangChain"
+authors = []
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "langchain-core>=1.2.11,<2.0",
+    "psycopg[binary]>=3,<4",
+    "psycopg-pool>=3.2.1,<4",
+    "numpy>=1.21,<3",
+]
+
+[project.urls]
+"Source Code" = "https://github.com/serenedb/langchain-serenedb"
+
+[project.optional-dependencies]
+test = [
+    "langchain-tests>=1.1.5",
+    "mypy>=1.15.0",
+    "pytest>=8.3.4",
+    "pytest-asyncio>=0.25.3",
+    "pytest-cov>=6.0.0",
+    "pytest-mock>=3.14.0",
+    "pytest-timeout>=2.3.1",
+    "ruff>=0.9.7",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["langchain_serenedb"]
+
+[tool.ruff.lint]
+select = [
+  "E",    # pycodestyle
+  "F",    # pyflakes
+  "I",    # isort
+  "T201", # print
+]
+
+[tool.ruff.lint.extend-per-file-ignores]
+"langchain_serenedb/**/*.py" = ["E501"]
+"tests/**/*.py" = ["E501"]
+
+[tool.mypy]
+disallow_untyped_defs = "True"
+
+[tool.coverage.run]
+omit = ["tests/*"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers --strict-config --durations=5"
+timeout = 60
+markers = []
+asyncio_mode = "auto"
