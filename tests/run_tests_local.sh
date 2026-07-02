@@ -35,7 +35,7 @@
 # Examples:
 #   tests/run_tests_local.sh /path/to/serened
 #   tests/run_tests_local.sh serened --port 9999 -- -k hybrid -q
-#   PYTHON=.venv/bin/python tests/run_tests_local.sh ./build/bin/serened tests/unit_tests/test_standard_suite.py
+#   PYTHON=.venv/bin/python tests/run_tests_local.sh ./build/bin/serened tests/integration_tests/test_standard_suite.py
 
 set -uo pipefail
 

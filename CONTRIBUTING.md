@@ -21,21 +21,24 @@ Regenerate the lock after changing dependencies in `pyproject.toml` with `uv loc
 
 ## Linting, formatting, and type-checking
 
-Lint and format with [pre-commit](https://pre-commit.com) — it bundles Ruff and
-repo-hygiene checks (`.pre-commit-config.yaml`, with Ruff pinned to the `uv.lock`
-version). Run a full sweep, applying fixes:
+All checks run through [pre-commit](https://pre-commit.com): Ruff (lint + format),
+repo-hygiene hooks, and mypy (type-check). Config is in `.pre-commit-config.yaml`, with
+Ruff pinned to the `uv.lock` version. Run a full sweep (Ruff applies fixes; mypy only
+reports):
 
 ```bash
 pre-commit run --all-files
 ```
 
 It is run **explicitly, not as a git hook** — so the formatter never rewrites your
-commits and you stay in control of what/when to format. CI validates pull requests in
-check mode without modifying anything (`ruff check . && ruff format --check .`) — to be
-added to the workflow later.
+commits and you stay in control of what/when to format. CI runs the same hooks as a gate
+with `pre-commit run --all-files --show-diff-on-failure`: any fix a hook would apply
+fails the job (printing the diff) but is never committed, since the CI checkout is
+throwaway. (Added to the workflow later.)
 
-Type-check separately with mypy (intentionally not a pre-commit hook — it needs the
-project's dependencies to resolve imports):
+mypy is a `local` hook that runs the project's own environment (`uv run --extra test
+mypy`, so it needs `uv` on PATH) rather than an isolated one that could not resolve the
+project's imports. Run it standalone with:
 
 ```bash
 mypy langchain_serenedb   # or: uv run --extra test mypy langchain_serenedb
