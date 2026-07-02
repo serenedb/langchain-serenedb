@@ -280,3 +280,90 @@ def test_rrf_fusion():
     finally:
         engine.drop_table(table)
         engine._run_as_sync(engine.close())
+
+
+def test_vector_search_in_non_public_schema():
+    """Dense search must route through the schema-qualified HNSW index."""
+    schema = f"lc_sch_{uuid.uuid4().hex[:8]}"
+    table = "vitems"
+    engine = SereneDBEngine.from_connection_string(CONNINFO)
+    engine._run_as_sync(engine._aexecute(f'CREATE SCHEMA IF NOT EXISTS "{schema}";'))
+    engine.init_vectorstore_table(
+        table,
+        DIM,
+        overwrite_existing=True,
+        schema_name=schema,
+        metadata_columns=[Column("category", "TEXT")],
+        vector_index=HNSWIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE),
+    )
+    vs = SereneDBVectorStore.create_sync(
+        engine, DetEmb(), table, schema_name=schema, metadata_columns=["category"]
+    )
+    try:
+        # The HNSW index lives in the custom schema and must resolve there.
+        assert vs.is_valid_index() is True
+        vs.add_texts(
+            ["the quick brown fox", "a lazy dog", "quantum physics"],
+            metadatas=[
+                {"category": "animal"},
+                {"category": "animal"},
+                {"category": "science"},
+            ],
+        )
+        res = vs.similarity_search("the quick brown fox", k=1)
+        assert res[0].page_content == "the quick brown fox"
+        # Filtered dense search, also from the schema-qualified index relation.
+        res = vs.similarity_search("x", k=5, filter={"category": "science"})
+        assert [d.page_content for d in res] == ["quantum physics"]
+    finally:
+        engine.drop_table(table, schema_name=schema)
+        engine._run_as_sync(
+            engine._aexecute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;')
+        )
+        engine._run_as_sync(engine.close())
+
+
+def test_hybrid_search_in_non_public_schema():
+    """Hybrid needs the text search dictionary and index both in the custom schema."""
+    schema = f"lc_sch_{uuid.uuid4().hex[:8]}"
+    table = "hitems"
+    engine = SereneDBEngine.from_connection_string(CONNINFO)
+    engine._run_as_sync(engine._aexecute(f'CREATE SCHEMA IF NOT EXISTS "{schema}";'))
+    engine.init_vectorstore_table(
+        table,
+        DIM,
+        overwrite_existing=True,
+        schema_name=schema,
+        metadata_columns=[Column("category", "TEXT")],
+        hybrid_search_config=HybridSearchConfig(),
+    )
+    vs = SereneDBVectorStore.create_sync(
+        engine,
+        DetEmb(),
+        table,
+        schema_name=schema,
+        metadata_columns=["category"],
+        hybrid_search_config=HybridSearchConfig(primary_top_k=10, secondary_top_k=10),
+    )
+    try:
+        vs.add_texts(
+            ["the quick brown fox", "a lazy brown dog", "quantum physics"],
+            metadatas=[
+                {"category": "animal"},
+                {"category": "animal"},
+                {"category": "science"},
+            ],
+        )
+        res = vs.similarity_search("brown", k=3)
+        assert len(res) == 3
+        assert sum("brown" in d.page_content for d in res) >= 2
+        # Filter through the fused (vector + BM25) path.
+        res = vs.similarity_search("brown", k=5, filter={"category": "animal"})
+        assert res
+        assert all(d.metadata["category"] == "animal" for d in res)
+    finally:
+        engine.drop_table(table, schema_name=schema)
+        engine._run_as_sync(
+            engine._aexecute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;')
+        )
+        engine._run_as_sync(engine.close())

@@ -66,8 +66,10 @@ def validate_identifier(identifier: str) -> None:
 class BaseIndex(ABC):
     """Abstract base class for defining vector indexes.
 
+    The index name is not configurable here — the store derives one name per collection
+    from the table (see ``SereneDBVectorStore``), so a collection has exactly one index.
+
     Attributes:
-        name (Optional[str]): A human-readable name for the index. Defaults to None.
         index_type (str): A string identifying the type of index. Defaults to "base".
         distance_strategy (DistanceStrategy): The strategy used to calculate distances
             between vectors in the index. Defaults to DistanceStrategy.COSINE_DISTANCE.
@@ -75,7 +77,6 @@ class BaseIndex(ABC):
             at build time.
     """
 
-    name: Optional[str] = None
     index_type: str = "base"
     distance_strategy: DistanceStrategy = field(
         default_factory=lambda: DistanceStrategy.COSINE_DISTANCE
@@ -179,11 +180,17 @@ def _quote_ident(name: str) -> str:
 
 
 def build_dictionary_ddl(
-    dictionary_name: str, options: str, *, if_not_exists: bool = True
+    schema_name: str, dictionary_name: str, options: str, *, if_not_exists: bool = True
 ) -> str:
-    """CREATE TEXT SEARCH DICTIONARY statement (for the full-text/hybrid analyzer)."""
+    """CREATE TEXT SEARCH DICTIONARY statement (for the full-text/hybrid analyzer).
+
+    Created in the table's schema so the hybrid index (which resolves the dictionary
+    opclass in its own schema) can find it — a bare/other-schema dictionary is invisible
+    to an index in a non-public schema.
+    """
     ine = "IF NOT EXISTS " if if_not_exists else ""
-    return f"CREATE TEXT SEARCH DICTIONARY {ine}{_quote_ident(dictionary_name)} ({options});"
+    qualified = f"{_quote_ident(schema_name)}.{_quote_ident(dictionary_name)}"
+    return f"CREATE TEXT SEARCH DICTIONARY {ine}{qualified} ({options});"
 
 
 def build_vector_index_ddl(

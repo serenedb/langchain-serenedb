@@ -199,7 +199,6 @@ class HybridSearchConfig(ABC):
         fusion_function_parameters: Extra kwargs forwarded to ``fusion_function``.
         primary_top_k: Rows to fetch from the vector branch before fusion.
         secondary_top_k: Rows to fetch from the keyword branch before fusion.
-        index_name: Name of the inverted index that covers the content column.
         dictionary_name: Text search dictionary used to analyze the content column.
         dictionary_options: Options for ``CREATE TEXT SEARCH DICTIONARY`` — must include
             ``frequency = true`` for scoring.
@@ -215,7 +214,6 @@ class HybridSearchConfig(ABC):
     fusion_function_parameters: dict[str, Any] = field(default_factory=dict)
     primary_top_k: int = 4
     secondary_top_k: int = 4
-    index_name: str = "langchain_inverted_index"
     dictionary_name: str = "langchain_fts_dict"
     dictionary_options: str = (
         "template = 'text', locale = 'en_US.UTF-8', "

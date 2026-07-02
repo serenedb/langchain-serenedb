@@ -312,6 +312,7 @@ class SereneDBEngine:
             if hybrid_search_config is not None:
                 await self._aexecute(
                     build_dictionary_ddl(
+                        raw_schema_name,
                         hybrid_search_config.dictionary_name,
                         hybrid_search_config.dictionary_options,
                     )
@@ -323,19 +324,18 @@ class SereneDBEngine:
                         content_column=raw_content_column,
                         embedding_column=raw_embedding_column,
                         id_column=raw_id_column_name,
-                        index_name=hybrid_search_config.index_name,
+                        index_name=raw_table_name + DEFAULT_INDEX_NAME_SUFFIX,
                         dictionary_name=hybrid_search_config.dictionary_name,
                         hnsw_options=hnsw_options,
                     )
                 )
             else:
-                index_name = index.name or (raw_table_name + DEFAULT_INDEX_NAME_SUFFIX)
                 await self._aexecute(
                     build_vector_index_ddl(
                         schema_name=raw_schema_name,
                         table_name=raw_table_name,
                         embedding_column=raw_embedding_column,
-                        index_name=index_name,
+                        index_name=raw_table_name + DEFAULT_INDEX_NAME_SUFFIX,
                         hnsw_options=hnsw_options,
                     )
                 )

@@ -116,10 +116,34 @@ class AsyncSereneDBVectorStore(VectorStore):
         self.lambda_mult = lambda_mult
         self.index_query_options = index_query_options
         self.hybrid_search_config = hybrid_search_config
+        # Cached result of is_valid_index(): None = not checked yet. Kept in sync by
+        # aapply_vector_index / adrop_vector_index so the dense query need not probe
+        # pg_indexes on every search.
+        self._index_exists: Optional[bool] = None
 
     @property
     def embeddings(self) -> Embeddings:
         return self.embedding_service
+
+    async def _avector_index_available(self) -> bool:
+        """Whether this collection's HNSW index exists (cached).
+
+        The dense query only uses the index when selecting from it by name, so it needs
+        to know whether the index is there. Determined once via ``is_valid_index`` and
+        then cached; index create/drop update the cache.
+        """
+        if self._index_exists is None:
+            self._index_exists = await self.is_valid_index()
+        return self._index_exists
+
+    @property
+    def _vector_index_name(self) -> str:
+        """The single inverted index this collection uses.
+
+        One index per collection (vector-only or the combined hybrid index); its name is
+        derived from the table so the store always knows it without tracking user input.
+        """
+        return self.table_name + DEFAULT_INDEX_NAME_SUFFIX
 
     @classmethod
     async def create(
@@ -432,10 +456,19 @@ class AsyncSereneDBVectorStore(VectorStore):
             safe_filter, filter_dict = self._create_filter_clause(filter)
         where_filters = f"WHERE {safe_filter}" if safe_filter else ""
 
+        # SereneDB routes an ``ORDER BY emb <op> q LIMIT k`` through the HNSW index only
+        # when selecting *from the index by name*; querying the base table scans exactly.
+        # So read from the index when it exists, and fall back to an exact scan of the
+        # table otherwise.
+        if await self._avector_index_available():
+            source = f'"{self.schema_name}"."{self._vector_index_name}"'
+        else:
+            source = f'"{self.schema_name}"."{self.table_name}"'
+
         query = (
             f"SELECT {column_names}, "
             f'{search_function}("{self.embedding_column}", %(query_embedding)s::FLOAT[{dim}]) AS distance '
-            f'FROM "{self.schema_name}"."{self.table_name}" {where_filters} '
+            f"FROM {source} {where_filters} "
             f'ORDER BY "{self.embedding_column}" {operator} %(query_embedding)s::FLOAT[{dim}] '
             f"LIMIT %(dense_limit)s;"
         )
@@ -463,7 +496,8 @@ class AsyncSereneDBVectorStore(VectorStore):
     ) -> list[dict[str, Any]]:
         """Run the lexical (BM25) branch against the inverted index by name."""
         column_names = self._select_columns(include_embedding=False)
-        index_name = self.engine._escape_identifier(hybrid_search_config.index_name)
+        schema_name = self.engine._escape_identifier(self.schema_name)
+        index_name = self.engine._escape_identifier(self._vector_index_name)
         scorer = hybrid_search_config.scorer
         tsquery_fn = hybrid_search_config.tsquery_function
 
@@ -472,9 +506,11 @@ class AsyncSereneDBVectorStore(VectorStore):
             safe_filter, filter_dict = self._create_filter_clause(filter)
         and_filters = f"AND ({safe_filter})" if safe_filter else ""
 
+        # Schema-qualify the index (a bare name does not resolve in a non-public schema);
+        # the relation's implicit alias is the bare index name, so tableoid uses that.
         query = (
             f'SELECT {column_names}, {scorer}("{index_name}".tableoid) AS distance '
-            f'FROM "{index_name}" '
+            f'FROM "{schema_name}"."{index_name}" '
             f'WHERE "{self.content_column}" @@ {tsquery_fn}(%(fts_query)s) {and_filters} '
             f'ORDER BY distance DESC, "{self.id_column}" '
             f"LIMIT %(sparse_limit)s;"
@@ -663,22 +699,25 @@ class AsyncSereneDBVectorStore(VectorStore):
     async def _acreate_text_search_dictionary(self, config: HybridSearchConfig) -> None:
         """Create the text search dictionary used to analyze the content column."""
         await self.engine._aexecute(
-            build_dictionary_ddl(config.dictionary_name, config.dictionary_options)
+            build_dictionary_ddl(
+                self.schema_name, config.dictionary_name, config.dictionary_options
+            )
         )
 
     async def aapply_vector_index(
         self,
         index: BaseIndex,
-        name: Optional[str] = None,
         *,
         concurrently: bool = False,
     ) -> None:
-        """Create the HNSW inverted index on the embedding column.
+        """Create the collection's single HNSW inverted index on the embedding column.
 
-        When a ``hybrid_search_config`` is set, a single combined inverted index is
-        created over both the content column (analyzed with a BM25-capable dictionary)
-        and the embedding column, with the id stored via ``INCLUDE`` so the lexical
-        branch can return it.
+        The index name is derived from the table (:attr:`_vector_index_name`) — one
+        index per collection, fully controlled by the store. When a
+        ``hybrid_search_config`` is set, a single combined inverted index is created over
+        both the content column (analyzed with a BM25-capable dictionary) and the
+        embedding column, with the id stored via ``INCLUDE`` so the lexical branch can
+        return it.
         """
         if isinstance(index, ExactNearestNeighbor):
             await self.adrop_vector_index()
@@ -687,10 +726,10 @@ class AsyncSereneDBVectorStore(VectorStore):
             # Keep the index metric aligned with the store's query operator.
             index.distance_strategy = self.distance_strategy
         hnsw_options = index.index_options()
+        index_name = self._vector_index_name
 
         if self.hybrid_search_config:
             await self._acreate_text_search_dictionary(self.hybrid_search_config)
-            index_name = name or self.hybrid_search_config.index_name
             stmt = build_hybrid_index_ddl(
                 schema_name=self.schema_name,
                 table_name=self.table_name,
@@ -702,10 +741,6 @@ class AsyncSereneDBVectorStore(VectorStore):
                 hnsw_options=hnsw_options,
             )
         else:
-            index_name = (
-                name or index.name or (self.table_name + DEFAULT_INDEX_NAME_SUFFIX)
-            )
-            index.name = index_name
             stmt = build_vector_index_ddl(
                 schema_name=self.schema_name,
                 table_name=self.table_name,
@@ -714,8 +749,7 @@ class AsyncSereneDBVectorStore(VectorStore):
                 hnsw_options=hnsw_options,
             )
         await self.engine._aexecute(stmt)
-        # Publish existing rows so the new index is immediately searchable.
-        await self.engine._arefresh_table(self.table_name, schema_name=self.schema_name)
+        self._index_exists = True
 
     async def aapply_hybrid_search_index(self, concurrently: bool = False) -> None:
         """Create the combined inverted index for hybrid search."""
@@ -729,20 +763,21 @@ class AsyncSereneDBVectorStore(VectorStore):
             HNSWIndex(distance_strategy=self.distance_strategy)
         )
 
-    async def areindex(self, index_name: Optional[str] = None) -> None:
+    async def areindex(self) -> None:
         """Recompute inverted-index statistics (SereneDB has no ``REINDEX``)."""
         await self.engine._aexecute_autocommit(
             f'VACUUM (RECOMPUTE_STATS_TABLE) "{self.schema_name}"."{self.table_name}";'
         )
 
-    async def adrop_vector_index(self, index_name: Optional[str] = None) -> None:
-        index_name = index_name or (self.table_name + DEFAULT_INDEX_NAME_SUFFIX)
+    async def adrop_vector_index(self) -> None:
+        index_name = self._vector_index_name
         await self.engine._aexecute(
             f'DROP INDEX IF EXISTS "{self.schema_name}"."{index_name}";'
         )
+        self._index_exists = False
 
-    async def is_valid_index(self, index_name: Optional[str] = None) -> bool:
-        index_name = index_name or (self.table_name + DEFAULT_INDEX_NAME_SUFFIX)
+    async def is_valid_index(self) -> bool:
+        index_name = self._vector_index_name
         query = (
             "SELECT tablename, indexname FROM pg_indexes "
             "WHERE tablename = %(table_name)s AND schemaname = %(schema_name)s "

@@ -188,12 +188,11 @@ class SereneDBVectorStore(VectorStore):
     def apply_vector_index(
         self,
         index: BaseIndex,
-        name: Optional[str] = None,
         *,
         concurrently: bool = False,
     ) -> None:
         return self._engine._run_as_sync(
-            self.__vs.aapply_vector_index(index, name=name, concurrently=concurrently)
+            self.__vs.aapply_vector_index(index, concurrently=concurrently)
         )
 
     def apply_hybrid_search_index(self, *, concurrently: bool = False) -> None:
@@ -201,14 +200,14 @@ class SereneDBVectorStore(VectorStore):
             self.__vs.aapply_hybrid_search_index(concurrently=concurrently)
         )
 
-    def reindex(self, index_name: Optional[str] = None) -> None:
-        return self._engine._run_as_sync(self.__vs.areindex(index_name))
+    def reindex(self) -> None:
+        return self._engine._run_as_sync(self.__vs.areindex())
 
-    def drop_vector_index(self, index_name: Optional[str] = None) -> None:
-        return self._engine._run_as_sync(self.__vs.adrop_vector_index(index_name))
+    def drop_vector_index(self) -> None:
+        return self._engine._run_as_sync(self.__vs.adrop_vector_index())
 
-    def is_valid_index(self, index_name: Optional[str] = None) -> bool:
-        return self._engine._run_as_sync(self.__vs.is_valid_index(index_name))
+    def is_valid_index(self) -> bool:
+        return self._engine._run_as_sync(self.__vs.is_valid_index())
 
     @classmethod
     def from_texts(cls, *args: Any, **kwargs: Any) -> SereneDBVectorStore:
