@@ -326,8 +326,17 @@ class AsyncSereneDBVectorStore(VectorStore):
         upsert_stmt += ";"
         statement = insert_stmt + values_stmt + upsert_stmt
 
-        params_seq: list[dict[str, Any]] = []
+        # Collapse duplicate ids within this batch, last write wins. The whole batch is
+        # one transaction, and a single INSERT may not resolve ON CONFLICT against a row
+        # inserted earlier in the same *uncommitted* transaction (engine-dependent), so a
+        # repeated id would otherwise raise a duplicate-key error. Deduping keeps
+        # last-write-wins semantics and makes the batch safe regardless.
+        rows_by_id: dict[Any, tuple[str, list[float], dict]] = {}
         for id, content, embedding, metadata in zip(ids, texts, embeddings, metadatas):
+            rows_by_id[id] = (content, embedding, metadata)
+
+        params_seq: list[dict[str, Any]] = []
+        for id, (content, embedding, metadata) in rows_by_id.items():
             values: dict[str, Any] = {
                 "langchain_id": id,
                 "content": content,
