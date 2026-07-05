@@ -159,9 +159,17 @@ class SereneDBEngine:
             await self._pool.open()
             self._opened = True
 
-    async def close(self) -> None:
+    async def aclose(self) -> None:
         """Dispose of the connection pool."""
         await self._run_as_async(self._pool.close())
+
+    def close(self) -> None:
+        """Dispose of the connection pool (sync).
+
+        Sync counterpart of :meth:`aclose`, so sync callers can just write
+        ``engine.close()`` instead of ``engine._run_as_sync(engine.close())``.
+        """
+        self._run_as_sync(self._pool.close())
 
     # -- low-level execution helpers -------------------------------------------------
 
@@ -172,6 +180,22 @@ class SereneDBEngine:
         await self._ensure_open()
         async with self._pool.connection() as conn:
             await conn.execute(query, params)
+            await conn.commit()
+
+    async def _aexecute_many(
+        self, query: str, params_seq: Sequence[Union[dict, Sequence]]
+    ) -> None:
+        """Execute one statement for many parameter sets on a single connection.
+
+        Uses psycopg's ``executemany`` (pipelined) with a single commit, so a bulk
+        write is one checkout + one transaction instead of one per row.
+        """
+        if not params_seq:
+            return
+        await self._ensure_open()
+        async with self._pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.executemany(query, params_seq)
             await conn.commit()
 
     async def _afetch(
@@ -220,6 +244,7 @@ class SereneDBEngine:
         metadata_json_column: str = "langchain_metadata",
         id_column: Union[str, Column, ColumnDict] = "langchain_id",
         overwrite_existing: bool = False,
+        if_not_exists: bool = False,
         store_metadata: bool = True,
         vector_index: Optional[BaseIndex] = None,
         hybrid_search_config: Optional[HybridSearchConfig] = None,
@@ -230,7 +255,18 @@ class SereneDBEngine:
         stored in a ``JSON`` column. Full-text search (when configured) indexes the
         ``content`` column directly, so no separate column is added here (see
         :class:`~langchain_serenedb.hybrid_search_config.HybridSearchConfig`).
+
+        ``if_not_exists=True`` makes the call idempotent: the table (and its index) are
+        created only when absent, so re-running does not error and keeps existing data.
+        It does NOT reconcile an existing table's shape — if a table with this name
+        already exists, its columns are left as-is (use :meth:`create` to validate them).
+        Mutually exclusive with ``overwrite_existing`` (which drops and recreates).
         """
+        if overwrite_existing and if_not_exists:
+            raise ValueError(
+                "Use only one of overwrite_existing (drop + recreate) or "
+                "if_not_exists (create only when absent)."
+            )
         # Keep raw names for the index-DDL builders (which escape internally).
         raw_schema_name = schema_name
         raw_table_name = table_name
@@ -272,8 +308,9 @@ class SereneDBEngine:
         if overwrite_existing:
             await self._aexecute(f'DROP TABLE IF EXISTS "{schema_name}"."{table_name}"')
 
+        ine = "IF NOT EXISTS " if if_not_exists else ""
         query = (
-            f'CREATE TABLE "{schema_name}"."{table_name}"(\n'
+            f'CREATE TABLE {ine}"{schema_name}"."{table_name}"(\n'
             f'"{id_column_name}" {id_data_type} PRIMARY KEY,\n'
             f'"{content_column}" TEXT NOT NULL,\n'
             f'"{embedding_column}" FLOAT[{int(vector_size)}] NOT NULL'
@@ -327,6 +364,7 @@ class SereneDBEngine:
                         index_name=raw_table_name + DEFAULT_INDEX_NAME_SUFFIX,
                         dictionary_name=hybrid_search_config.dictionary_name,
                         hnsw_options=hnsw_options,
+                        if_not_exists=if_not_exists,
                     )
                 )
             else:
@@ -337,6 +375,7 @@ class SereneDBEngine:
                         embedding_column=raw_embedding_column,
                         index_name=raw_table_name + DEFAULT_INDEX_NAME_SUFFIX,
                         hnsw_options=hnsw_options,
+                        if_not_exists=if_not_exists,
                     )
                 )
 
@@ -352,6 +391,7 @@ class SereneDBEngine:
         metadata_json_column: str = "langchain_metadata",
         id_column: Union[str, Column, ColumnDict] = "langchain_id",
         overwrite_existing: bool = False,
+        if_not_exists: bool = False,
         store_metadata: bool = True,
         vector_index: Optional[BaseIndex] = None,
         hybrid_search_config: Optional[HybridSearchConfig] = None,
@@ -361,6 +401,8 @@ class SereneDBEngine:
         Pass ``vector_index`` (e.g. ``HNSWIndex(distance_strategy=...)``) to also build
         the ANN index on the embedding column, or ``hybrid_search_config`` to build the
         combined full-text + vector index — both in the same call as table creation.
+        ``if_not_exists=True`` makes the call idempotent (create only when absent; keeps
+        existing data); it is mutually exclusive with ``overwrite_existing``.
         """
         await self._run_as_async(
             self._ainit_vectorstore_table(
@@ -373,6 +415,7 @@ class SereneDBEngine:
                 metadata_json_column=metadata_json_column,
                 id_column=id_column,
                 overwrite_existing=overwrite_existing,
+                if_not_exists=if_not_exists,
                 store_metadata=store_metadata,
                 vector_index=vector_index,
                 hybrid_search_config=hybrid_search_config,
@@ -391,6 +434,7 @@ class SereneDBEngine:
         metadata_json_column: str = "langchain_metadata",
         id_column: Union[str, Column, ColumnDict] = "langchain_id",
         overwrite_existing: bool = False,
+        if_not_exists: bool = False,
         store_metadata: bool = True,
         vector_index: Optional[BaseIndex] = None,
         hybrid_search_config: Optional[HybridSearchConfig] = None,
@@ -400,6 +444,8 @@ class SereneDBEngine:
         Pass ``vector_index`` (e.g. ``HNSWIndex(distance_strategy=...)``) to also build
         the ANN index on the embedding column, or ``hybrid_search_config`` to build the
         combined full-text + vector index — both in the same call as table creation.
+        ``if_not_exists=True`` makes the call idempotent (create only when absent; keeps
+        existing data); it is mutually exclusive with ``overwrite_existing``.
         """
         self._run_as_sync(
             self._ainit_vectorstore_table(
@@ -412,6 +458,7 @@ class SereneDBEngine:
                 metadata_json_column=metadata_json_column,
                 id_column=id_column,
                 overwrite_existing=overwrite_existing,
+                if_not_exists=if_not_exists,
                 store_metadata=store_metadata,
                 vector_index=vector_index,
                 hybrid_search_config=hybrid_search_config,

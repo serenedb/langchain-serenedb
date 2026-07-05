@@ -51,7 +51,7 @@ class TestSereneDBStandardSuiteSync(VectorStoreIntegrationTests):
             yield vs
         finally:
             engine.drop_table(table)
-            engine._run_as_sync(engine.close())
+            engine.close()
 
 
 class TestSereneDBStandardSuiteAsync(VectorStoreIntegrationTests):
@@ -67,4 +67,4 @@ class TestSereneDBStandardSuiteAsync(VectorStoreIntegrationTests):
             yield vs
         finally:
             await engine.adrop_table(table)
-            await engine.close()
+            await engine.aclose()

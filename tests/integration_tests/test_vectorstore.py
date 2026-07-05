@@ -95,7 +95,7 @@ def store():
     ids = vs.add_texts(texts, metadatas=metas)
     yield vs, ids
     engine.drop_table(table)
-    engine._run_as_sync(engine.close())
+    engine.close()
 
 
 def test_dense_search_exact_match(store):
@@ -139,6 +139,129 @@ def test_and_with_json_filter(store):
         "x", k=5, filter={"$and": [{"category": "animal"}, {"n": {"$lt": 2}}]}
     )
     assert [d.page_content for d in res] == ["the quick brown fox"]
+
+
+def test_add_rows_with_missing_metadata_column(store):
+    vs, _ = store
+    # The batched insert uses one uniform statement, so a row that omits a metadata
+    # column must bind NULL for it (not error / not shift columns).
+    vs.add_texts(
+        ["a red apple", "a blue sky"],
+        metadatas=[{"category": "fruit"}, {}],
+    )
+    only_fruit = [
+        d.page_content
+        for d in vs.similarity_search("a red apple", k=10, filter={"category": "fruit"})
+    ]
+    assert "a red apple" in only_fruit
+    assert "a blue sky" not in only_fruit  # NULL category excluded by the filter
+    # The row with no category is still retrievable without a filter.
+    unfiltered = vs.similarity_search("a blue sky", k=10)
+    assert any(d.page_content == "a blue sky" for d in unfiltered)
+
+
+def test_upsert_many_updates_existing_rows(store):
+    """Batched add where every id conflicts: each row is updated in place."""
+    vs, _ = store
+    ids = [str(uuid.uuid4()) for _ in range(3)]
+    vs.add_texts(
+        ["old a", "old b", "old c"],
+        metadatas=[
+            {"category": "x", "n": 1},
+            {"category": "x", "n": 2},
+            {"category": "y", "n": 3},
+        ],
+        ids=ids,
+    )
+    # Re-add the SAME ids with new content + metadata (typed column and JSON both change).
+    returned = vs.add_texts(
+        ["new a", "new b", "new c"],
+        metadatas=[
+            {"category": "z", "n": 10},
+            {"category": "z", "n": 20},
+            {"category": "z", "n": 30},
+        ],
+        ids=ids,
+    )
+    assert returned == ids
+    got = {d.id: d for d in vs.get_by_ids(ids)}
+    assert len(got) == 3  # upsert, not duplicate insert
+    assert got[ids[0]].page_content == "new a"
+    # Both the typed column (category) and the JSON blob (n) are updated.
+    assert got[ids[0]].metadata == {"category": "z", "n": 10}
+    assert {d.page_content for d in got.values()} == {"new a", "new b", "new c"}
+
+
+def test_upsert_many_mixed_insert_and_update(store):
+    """One batched add mixing existing ids (update) and new ids (insert)."""
+    vs, _ = store
+    existing = [str(uuid.uuid4()) for _ in range(2)]
+    vs.add_texts(
+        ["keep 1", "keep 2"],
+        metadatas=[{"category": "a"}, {"category": "a"}],
+        ids=existing,
+    )
+    new = [str(uuid.uuid4()) for _ in range(2)]
+    vs.add_texts(
+        ["upd 1", "upd 2", "ins 1", "ins 2"],
+        metadatas=[
+            {"category": "b"},
+            {"category": "b"},
+            {"category": "c"},
+            {"category": "c"},
+        ],
+        ids=existing + new,
+    )
+    got = {d.id: d for d in vs.get_by_ids(existing + new)}
+    assert len(got) == 4
+    assert got[existing[0]].page_content == "upd 1"  # existing row updated
+    assert got[existing[0]].metadata["category"] == "b"
+    assert got[new[0]].page_content == "ins 1"  # new row inserted
+    assert got[new[0]].metadata["category"] == "c"
+
+
+def test_upsert_duplicate_id_within_one_batch(store):
+    """The same id twice in a single batch: the last write wins."""
+    vs, _ = store
+    dup = str(uuid.uuid4())
+    other = str(uuid.uuid4())
+    vs.add_texts(
+        ["first write", "unrelated", "second write"],
+        metadatas=[{"category": "a"}, {"category": "b"}, {"category": "c"}],
+        ids=[dup, other, dup],
+    )
+    got = {d.id: d for d in vs.get_by_ids([dup, other])}
+    assert len(got) == 2  # dup collapsed to one row
+    assert got[dup].page_content == "second write"
+    assert got[dup].metadata["category"] == "c"
+    assert got[other].page_content == "unrelated"
+
+
+def test_upsert_interleaved_repeated_ids_within_one_batch(store):
+    """Several ids repeated and interleaved in one batch: each ends at its last write."""
+    vs, _ = store
+    a, b, c = (str(uuid.uuid4()) for _ in range(3))
+    # a appears 3x, b 2x, c once, interleaved so ordering (not grouping) decides winners.
+    ids = [a, b, a, c, b, a]
+    texts = ["a1", "b1", "a2", "c1", "b2", "a3"]
+    metas = [
+        {"category": "a", "n": 1},
+        {"category": "b", "n": 1},
+        {"category": "a", "n": 2},
+        {"category": "c", "n": 1},
+        {"category": "b", "n": 2},
+        {"category": "a", "n": 3},
+    ]
+    vs.add_texts(texts, metadatas=metas, ids=ids)
+    got = {d.id: d for d in vs.get_by_ids([a, b, c])}
+    assert len(got) == 3  # 6 input rows collapse to 3 distinct ids
+    # Each id reflects its LAST occurrence, content + typed column + JSON alike.
+    assert got[a].page_content == "a3"
+    assert got[a].metadata == {"category": "a", "n": 3}
+    assert got[b].page_content == "b2"
+    assert got[b].metadata == {"category": "b", "n": 2}
+    assert got[c].page_content == "c1"
+    assert got[c].metadata == {"category": "c", "n": 1}
 
 
 def test_get_by_ids(store):
@@ -194,7 +317,7 @@ def hybrid_store():
     vs.apply_hybrid_search_index()
     yield vs
     engine.drop_table(table)
-    engine._run_as_sync(engine.close())
+    engine.close()
 
 
 def test_hybrid_search(hybrid_store):
@@ -235,7 +358,7 @@ def test_init_creates_vector_index():
         assert res[0].page_content == "alpha"
     finally:
         engine.drop_table(table)
-        engine._run_as_sync(engine.close())
+        engine.close()
 
 
 def test_init_creates_hybrid_index():
@@ -259,7 +382,7 @@ def test_init_creates_hybrid_index():
         assert sum("brown" in d.page_content for d in res) >= 2
     finally:
         engine.drop_table(table)
-        engine._run_as_sync(engine.close())
+        engine.close()
 
 
 def test_rrf_fusion():
@@ -279,7 +402,7 @@ def test_rrf_fusion():
         assert len(res) >= 1
     finally:
         engine.drop_table(table)
-        engine._run_as_sync(engine.close())
+        engine.close()
 
 
 def test_vector_search_in_non_public_schema():
@@ -320,7 +443,7 @@ def test_vector_search_in_non_public_schema():
         engine._run_as_sync(
             engine._aexecute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;')
         )
-        engine._run_as_sync(engine.close())
+        engine.close()
 
 
 def test_hybrid_search_in_non_public_schema():
@@ -366,4 +489,31 @@ def test_hybrid_search_in_non_public_schema():
         engine._run_as_sync(
             engine._aexecute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE;')
         )
-        engine._run_as_sync(engine.close())
+        engine.close()
+
+
+def test_init_if_not_exists_is_idempotent():
+    """A second init with if_not_exists is a no-op: no error, data + index kept."""
+    table = f"lc_ine_{uuid.uuid4().hex[:8]}"
+    engine = SereneDBEngine.from_connection_string(CONNINFO)
+    engine.init_vectorstore_table(
+        table, DIM, if_not_exists=True, vector_index=HNSWIndex()
+    )
+    vs = SereneDBVectorStore.create_sync(engine, DetEmb(), table)
+    try:
+        vs.add_texts(["alpha", "beta"])
+        # Re-init: must not error, must not wipe the rows, must keep the index.
+        engine.init_vectorstore_table(
+            table, DIM, if_not_exists=True, vector_index=HNSWIndex()
+        )
+        assert vs.is_valid_index() is True
+        res = vs.similarity_search("alpha", k=1)
+        assert res[0].page_content == "alpha"
+        # if_not_exists and overwrite_existing are mutually exclusive.
+        with pytest.raises(ValueError):
+            engine.init_vectorstore_table(
+                table, DIM, overwrite_existing=True, if_not_exists=True
+            )
+    finally:
+        engine.drop_table(table)
+        engine.close()
