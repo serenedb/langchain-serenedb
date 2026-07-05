@@ -286,64 +286,68 @@ class AsyncSereneDBVectorStore(VectorStore):
         if not metadatas:
             metadatas = [{} for _ in texts]
 
+        if not texts:
+            return ids
+
+        # Build ONE uniform INSERT ... ON CONFLICT statement for every row (the columns
+        # are fixed; absent metadata columns bind NULL), then run it as a single batched
+        # statement -- one connection, one commit -- instead of one round-trip per row.
+        dim = len(embeddings[0])
+        metadata_col_names = "".join(f', "{col}"' for col in self.metadata_columns)
+        insert_stmt = (
+            f'INSERT INTO "{self.schema_name}"."{self.table_name}"('
+            f'"{self.id_column}", "{self.content_column}", "{self.embedding_column}"'
+            f"{metadata_col_names}"
+        )
+        values_stmt = (
+            f"VALUES (%(langchain_id)s, %(content)s, %(embedding)s::FLOAT[{dim}]"
+        )
+        for col in self.metadata_columns:
+            values_stmt += f", %({col})s"
+        if self.metadata_json_column:
+            insert_stmt += f', "{self.metadata_json_column}")'
+            values_stmt += ", %(extra)s)"
+        else:
+            insert_stmt += ")"
+            values_stmt += ")"
+
+        upsert_stmt = (
+            f' ON CONFLICT ("{self.id_column}") DO UPDATE SET '
+            f'"{self.content_column}" = EXCLUDED."{self.content_column}", '
+            f'"{self.embedding_column}" = EXCLUDED."{self.embedding_column}"'
+        )
+        if self.metadata_json_column:
+            upsert_stmt += (
+                f', "{self.metadata_json_column}" = '
+                f'EXCLUDED."{self.metadata_json_column}"'
+            )
+        for column in self.metadata_columns:
+            upsert_stmt += f', "{column}" = EXCLUDED."{column}"'
+        upsert_stmt += ";"
+        statement = insert_stmt + values_stmt + upsert_stmt
+
+        params_seq: list[dict[str, Any]] = []
         for id, content, embedding, metadata in zip(ids, texts, embeddings, metadatas):
-            dim = len(embedding)
-            metadata_col_names = (
-                ", " + ", ".join(f'"{col}"' for col in self.metadata_columns)
-                if self.metadata_columns
-                else ""
-            )
-            insert_stmt = (
-                f'INSERT INTO "{self.schema_name}"."{self.table_name}"('
-                f'"{self.id_column}", "{self.content_column}", "{self.embedding_column}"'
-                f"{metadata_col_names}"
-            )
             values: dict[str, Any] = {
                 "langchain_id": id,
                 "content": content,
                 "embedding": [float(d) for d in embedding],
             }
-            values_stmt = (
-                f"VALUES (%(langchain_id)s, %(content)s, %(embedding)s::FLOAT[{dim}]"
-            )
-
             extra = dict(metadata)
             for metadata_column in self.metadata_columns:
                 if metadata_column in metadata:
-                    values_stmt += f", %({metadata_column})s"
+                    value = metadata[metadata_column]
                     values[metadata_column] = (
-                        json.dumps(metadata[metadata_column])
-                        if isinstance(metadata[metadata_column], dict)
-                        else metadata[metadata_column]
+                        json.dumps(value) if isinstance(value, dict) else value
                     )
                     del extra[metadata_column]
                 else:
-                    values_stmt += ", null"
-
+                    values[metadata_column] = None
             if self.metadata_json_column:
-                insert_stmt += f', "{self.metadata_json_column}")'
-                values_stmt += ", %(extra)s)"
                 values["extra"] = json.dumps(extra)
-            else:
-                insert_stmt += ")"
-                values_stmt += ")"
+            params_seq.append(values)
 
-            upsert_stmt = (
-                f' ON CONFLICT ("{self.id_column}") DO UPDATE SET '
-                f'"{self.content_column}" = EXCLUDED."{self.content_column}", '
-                f'"{self.embedding_column}" = EXCLUDED."{self.embedding_column}"'
-            )
-            if self.metadata_json_column:
-                upsert_stmt += (
-                    f', "{self.metadata_json_column}" = '
-                    f'EXCLUDED."{self.metadata_json_column}"'
-                )
-            for column in self.metadata_columns:
-                upsert_stmt += f', "{column}" = EXCLUDED."{column}"'
-            upsert_stmt += ";"
-
-            await self.engine._aexecute(insert_stmt + values_stmt + upsert_stmt, values)
-
+        await self.engine._aexecute_many(statement, params_seq)
         # Publish the writes to the inverted index (eventual consistency).
         await self.engine._arefresh_table(self.table_name, schema_name=self.schema_name)
         return ids
