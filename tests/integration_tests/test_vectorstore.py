@@ -517,3 +517,221 @@ def test_init_if_not_exists_is_idempotent():
     finally:
         engine.drop_table(table)
         engine.close()
+
+
+# -- JSON metadata-column filter tests -------------------------------------------------
+
+
+def _json_matches(vs, flt):
+    """page_content set of docs passing ``flt`` (k large enough to return all matches)."""
+    return {d.page_content for d in vs.similarity_search("alpha", k=10, filter=flt)}
+
+
+@pytest.fixture
+def json_store():
+    """Store with NO typed metadata columns, so every metadata key lives in the JSON blob.
+
+    Row / author / year / score / published / tag:
+      alpha   alice 2019 0.9 True  ml
+      bravo   bob   2020 0.5 False db
+      charlie carol 2021 0.1 True  ml-ops
+      delta   alice 2022 0.7 True  (no tag)
+      echo    dave  2018 0.3 False search
+    """
+    table = f"lc_json_{uuid.uuid4().hex[:8]}"
+    engine = SereneDBEngine.from_connection_string(CONNINFO)
+    engine.init_vectorstore_table(table, DIM, overwrite_existing=True)
+    vs = SereneDBVectorStore.create_sync(engine, DetEmb(), table)
+    vs.add_texts(
+        ["alpha", "bravo", "charlie", "delta", "echo"],
+        metadatas=[
+            {
+                "author": "alice",
+                "year": 2019,
+                "score": 0.9,
+                "published": True,
+                "tag": "ml",
+            },
+            {
+                "author": "bob",
+                "year": 2020,
+                "score": 0.5,
+                "published": False,
+                "tag": "db",
+            },
+            {
+                "author": "carol",
+                "year": 2021,
+                "score": 0.1,
+                "published": True,
+                "tag": "ml-ops",
+            },
+            {"author": "alice", "year": 2022, "score": 0.7, "published": True},
+            {
+                "author": "dave",
+                "year": 2018,
+                "score": 0.3,
+                "published": False,
+                "tag": "search",
+            },
+        ],
+    )
+    yield vs
+    engine.drop_table(table)
+    engine.close()
+
+
+def test_json_eq_string(json_store):
+    assert _json_matches(json_store, {"author": "alice"}) == {"alpha", "delta"}
+
+
+def test_json_ne_string(json_store):
+    assert _json_matches(json_store, {"author": {"$ne": "alice"}}) == {
+        "bravo",
+        "charlie",
+        "echo",
+    }
+
+
+def test_json_int_comparison_casts(json_store):
+    assert _json_matches(json_store, {"year": {"$gt": 2020}}) == {"charlie", "delta"}
+
+
+def test_json_float_between(json_store):
+    assert _json_matches(json_store, {"score": {"$between": [0.4, 0.8]}}) == {
+        "bravo",
+        "delta",
+    }
+
+
+def test_json_in(json_store):
+    assert _json_matches(json_store, {"author": {"$in": ["alice", "bob"]}}) == {
+        "alpha",
+        "bravo",
+        "delta",
+    }
+
+
+def test_json_nin(json_store):
+    assert _json_matches(json_store, {"author": {"$nin": ["alice", "bob"]}}) == {
+        "charlie",
+        "echo",
+    }
+
+
+def test_json_like(json_store):
+    assert _json_matches(json_store, {"tag": {"$like": "ml%"}}) == {"alpha", "charlie"}
+
+
+def test_json_ilike(json_store):
+    assert _json_matches(json_store, {"author": {"$ilike": "A%"}}) == {"alpha", "delta"}
+
+
+def test_json_exists(json_store):
+    assert _json_matches(json_store, {"tag": {"$exists": False}}) == {"delta"}
+    assert _json_matches(json_store, {"tag": {"$exists": True}}) == {
+        "alpha",
+        "bravo",
+        "charlie",
+        "echo",
+    }
+
+
+def test_json_bool(json_store):
+    assert _json_matches(json_store, {"published": True}) == {
+        "alpha",
+        "charlie",
+        "delta",
+    }
+
+
+def test_json_implicit_and_multikey(json_store):
+    # A multi-key dict is an implicit AND across JSON keys.
+    assert _json_matches(json_store, {"author": "alice", "published": True}) == {
+        "alpha",
+        "delta",
+    }
+
+
+def test_json_logical_operators(json_store):
+    assert _json_matches(
+        json_store, {"$and": [{"author": "alice"}, {"year": {"$gte": 2020}}]}
+    ) == {"delta"}
+    assert _json_matches(
+        json_store, {"$or": [{"author": "bob"}, {"year": {"$lt": 2019}}]}
+    ) == {"bravo", "echo"}
+    assert _json_matches(json_store, {"$not": [{"published": True}]}) == {
+        "bravo",
+        "echo",
+    }
+
+
+# -- combined typed-column + JSON filter tests -----------------------------------------
+
+
+@pytest.fixture
+def mixed_store():
+    """Store with a typed ``category`` column PLUS JSON keys (``year``, ``author``).
+
+    Row / category (typed) / year (json) / author (json):
+      alpha   animal  2019 alice
+      bravo   animal  2021 bob
+      charlie science 2020 alice
+      delta   science 2022 carol
+      echo    animal  2018 dave
+    """
+    table = f"lc_mixed_{uuid.uuid4().hex[:8]}"
+    engine = SereneDBEngine.from_connection_string(CONNINFO)
+    engine.init_vectorstore_table(
+        table,
+        DIM,
+        overwrite_existing=True,
+        metadata_columns=[Column("category", "TEXT")],
+    )
+    vs = SereneDBVectorStore.create_sync(
+        engine, DetEmb(), table, metadata_columns=["category"]
+    )
+    vs.add_texts(
+        ["alpha", "bravo", "charlie", "delta", "echo"],
+        metadatas=[
+            {"category": "animal", "year": 2019, "author": "alice"},
+            {"category": "animal", "year": 2021, "author": "bob"},
+            {"category": "science", "year": 2020, "author": "alice"},
+            {"category": "science", "year": 2022, "author": "carol"},
+            {"category": "animal", "year": 2018, "author": "dave"},
+        ],
+    )
+    yield vs
+    engine.drop_table(table)
+    engine.close()
+
+
+def test_mixed_implicit_and(mixed_store):
+    # Implicit AND: typed column (category) + JSON key (year) in one dict.
+    assert _json_matches(
+        mixed_store, {"category": "animal", "year": {"$gt": 2019}}
+    ) == {"bravo"}
+
+
+def test_mixed_and_typed_and_json(mixed_store):
+    assert _json_matches(
+        mixed_store, {"$and": [{"category": "science"}, {"author": "alice"}]}
+    ) == {"charlie"}
+
+
+def test_mixed_or_typed_and_json(mixed_store):
+    assert _json_matches(
+        mixed_store, {"$or": [{"category": "science"}, {"author": "bob"}]}
+    ) == {"bravo", "charlie", "delta"}
+
+
+def test_mixed_typed_and_multiple_json_ops(mixed_store):
+    # A typed-column predicate combined with several JSON operators.
+    flt = {
+        "$and": [
+            {"category": "animal"},
+            {"year": {"$between": [2019, 2021]}},
+            {"author": {"$in": ["alice", "bob"]}},
+        ]
+    }
+    assert _json_matches(mixed_store, flt) == {"alpha", "bravo"}
