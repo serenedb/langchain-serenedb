@@ -735,3 +735,48 @@ def test_mixed_typed_and_multiple_json_ops(mixed_store):
         ]
     }
     assert _json_matches(mixed_store, flt) == {"alpha", "bravo"}
+
+
+# -- relevance scores / similarity_score_threshold retriever ---------------------------
+
+
+def test_relevance_score_fn_selection():
+    """Each distance strategy maps to a [0, 1] relevance fn (needed for thresholding)."""
+    table = f"lc_relfn_{uuid.uuid4().hex[:8]}"
+    engine = SereneDBEngine.from_connection_string(CONNINFO)
+    engine.init_vectorstore_table(table, DIM, overwrite_existing=True)
+
+    def fn_for(ds):
+        vs = SereneDBVectorStore.create_sync(
+            engine, DetEmb(), table, distance_strategy=ds
+        )
+        return vs._select_relevance_score_fn()
+
+    try:
+        # For true distances (cosine/L2/L1), distance 0 == identical -> relevance 1.0.
+        assert fn_for(DistanceStrategy.COSINE_DISTANCE)(0.0) == pytest.approx(1.0)
+        assert fn_for(DistanceStrategy.EUCLIDEAN)(0.0) == pytest.approx(1.0)
+        assert fn_for(DistanceStrategy.MANHATTAN)(0.0) == pytest.approx(1.0)
+        # Inner product distance is -IP: a perfect unit match is -1 -> relevance 1.0.
+        assert fn_for(DistanceStrategy.INNER_PRODUCT)(-1.0) == pytest.approx(1.0)
+    finally:
+        engine.drop_table(table)
+        engine.close()
+
+
+def test_similarity_search_with_relevance_scores(store):
+    vs, _ = store
+    res = vs.similarity_search_with_relevance_scores("the quick brown fox", k=1)
+    doc, score = res[0]
+    assert doc.page_content == "the quick brown fox"
+    assert score == pytest.approx(1.0, abs=1e-3)  # exact match -> ~1.0 relevance
+
+
+def test_score_threshold_retriever(store):
+    vs, _ = store
+    retriever = vs.as_retriever(
+        search_type="similarity_score_threshold",
+        search_kwargs={"score_threshold": 0.9, "k": 3},
+    )
+    docs = retriever.invoke("the quick brown fox")
+    assert any(d.page_content == "the quick brown fox" for d in docs)

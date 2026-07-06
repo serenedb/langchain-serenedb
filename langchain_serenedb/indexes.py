@@ -45,7 +45,10 @@ class DistanceStrategy(StrategyMixin, enum.Enum):
 
     EUCLIDEAN = "<->", "l2_distance", "l2"
     COSINE_DISTANCE = "<=>", "cosine_distance", "cosine"
-    INNER_PRODUCT = "<#>", "inner_product", "ip"
+    # ``negative_inner_product`` (not raw ``inner_product``) is the function form of the
+    # ``<#>`` operator: it returns -IP, so smaller = more similar (a true distance,
+    # consistent with ORDER BY ``<#>`` and with the max-inner-product relevance score).
+    INNER_PRODUCT = "<#>", "negative_inner_product", "ip"
     MANHATTAN = "<+>", "l1_distance", "l1"
 
 

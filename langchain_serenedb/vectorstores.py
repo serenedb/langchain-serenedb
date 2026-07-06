@@ -8,7 +8,7 @@ methods are implemented the sync surface works automatically.
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence
 
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
@@ -182,6 +182,13 @@ class SereneDBVectorStore(VectorStore):
 
     def get_by_ids(self, ids: Sequence[str]) -> list[Document]:
         return self._engine._run_as_sync(self.__vs.aget_by_ids(ids))
+
+    def _select_relevance_score_fn(self) -> Callable[[float], float]:
+        """Delegate to the async store so the inherited
+        ``similarity_search_with_relevance_scores`` (and the
+        ``similarity_score_threshold`` retriever) work synchronously.
+        """
+        return self.__vs._select_relevance_score_fn()
 
     # -- index management ------------------------------------------------------------
 

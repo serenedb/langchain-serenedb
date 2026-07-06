@@ -20,7 +20,7 @@ from __future__ import annotations
 import datetime
 import json
 import uuid
-from typing import Any, Iterable, Optional, Sequence, cast
+from typing import Any, Callable, Iterable, Optional, Sequence, cast
 
 import numpy as np
 from langchain_core.documents import Document
@@ -144,6 +144,39 @@ class AsyncSereneDBVectorStore(VectorStore):
         derived from the table so the store always knows it without tracking user input.
         """
         return self.table_name + DEFAULT_INDEX_NAME_SUFFIX
+
+    @staticmethod
+    def _l1_relevance_score_fn(distance: float) -> float:
+        """Relevance score for L1 (Manhattan) distance, mirroring the base Euclidean fn.
+
+        For unit-normalized embeddings the L1 distance is 0 for identical vectors and 2
+        for orthogonal ones (the analogue of Euclidean's ``sqrt(2)``), so map onto a
+        [0, 1] similarity with ``1 - d/2``.
+        """
+        return 1.0 - distance / 2.0
+
+    def _select_relevance_score_fn(self) -> Callable[[float], float]:
+        """Map the distance strategy to a [0, 1] relevance-score function.
+
+        Required by ``similarity_search_with_relevance_scores`` and the
+        ``similarity_score_threshold`` retriever (the base class raises otherwise). The
+        distance we report matches each strategy's named function, so the base helpers
+        apply directly: cosine and L2 are true distances, and inner product is reported
+        as the *negative* inner product (see :class:`DistanceStrategy`), which is exactly
+        what the base max-inner-product helper expects. L1 uses our own helper above.
+        """
+        if self.distance_strategy == DistanceStrategy.COSINE_DISTANCE:
+            return self._cosine_relevance_score_fn
+        if self.distance_strategy == DistanceStrategy.EUCLIDEAN:
+            return self._euclidean_relevance_score_fn
+        if self.distance_strategy == DistanceStrategy.INNER_PRODUCT:
+            return self._max_inner_product_relevance_score_fn
+        if self.distance_strategy == DistanceStrategy.MANHATTAN:
+            return self._l1_relevance_score_fn
+        raise NotImplementedError(
+            f"No relevance-score function for distance strategy "
+            f"{self.distance_strategy.name}."
+        )
 
     @classmethod
     async def create(
