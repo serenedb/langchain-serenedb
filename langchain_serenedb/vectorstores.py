@@ -63,8 +63,14 @@ class SereneDBVectorStore(VectorStore):
         lambda_mult: float = 0.5,
         index_query_options: Optional[QueryOptions] = None,
         hybrid_search_config: Optional[HybridSearchConfig] = None,
+        sync_load: bool = True,
     ) -> SereneDBVectorStore:
-        """Async factory that builds the sync store (validating the table)."""
+        """Async factory that builds the sync store (validating the table).
+
+        ``sync_load=False`` skips the automatic inverted-index refresh after each write
+        so bulk loads run faster; the caller must then call ``refresh_table()`` to make
+        the rows visible to full-text / HNSW-routed queries.
+        """
         coro = AsyncSereneDBVectorStore.create(
             engine,
             embedding_service,
@@ -81,6 +87,7 @@ class SereneDBVectorStore(VectorStore):
             lambda_mult=lambda_mult,
             index_query_options=index_query_options,
             hybrid_search_config=hybrid_search_config,
+            sync_load=sync_load,
         )
         vs = await engine._run_as_async(coro)
         return cls(cls.__create_key, engine, vs)
