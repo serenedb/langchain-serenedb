@@ -77,6 +77,9 @@ def weighted_sum_ranking(
         "distance_strategy", DistanceStrategy.COSINE_DISTANCE
     )
     is_primary_distance = distance_strategy != DistanceStrategy.INNER_PRODUCT
+    # The result-row key the fused score is written under; the vector store picks a
+    # non-colliding alias when a real column is named "distance".
+    distance_key = kwargs.get("distance_key", "distance")
 
     # Normalize both sets of results onto a 0-1 scale
     normalized_primary = _normalize_scores(
@@ -95,7 +98,7 @@ def weighted_sum_ranking(
     # Process primary results
     for item in normalized_primary:
         doc_id = str(list(item.values())[0])
-        item["distance"] = item["normalized_score"] * primary_results_weight
+        item[distance_key] = item["normalized_score"] * primary_results_weight
         weighted_scores[doc_id] = item
 
     # Process secondary results
@@ -104,13 +107,13 @@ def weighted_sum_ranking(
         secondary_weighted_score = item["normalized_score"] * secondary_results_weight
 
         if doc_id in weighted_scores:
-            weighted_scores[doc_id]["distance"] += secondary_weighted_score
+            weighted_scores[doc_id][distance_key] += secondary_weighted_score
         else:
-            item["distance"] = secondary_weighted_score
+            item[distance_key] = secondary_weighted_score
             weighted_scores[doc_id] = item
 
     ranked_results = sorted(
-        weighted_scores.values(), key=lambda item: item["distance"], reverse=True
+        weighted_scores.values(), key=lambda item: item[distance_key], reverse=True
     )
 
     for result in ranked_results:
@@ -147,10 +150,13 @@ def reciprocal_rank_fusion(
     distance_strategy = kwargs.get(
         "distance_strategy", DistanceStrategy.COSINE_DISTANCE
     )
+    # The result-row key the fused score is read/written under; the vector store picks a
+    # non-colliding alias when a real column is named "distance".
+    distance_key = kwargs.get("distance_key", "distance")
     is_similarity_metric = distance_strategy == DistanceStrategy.INNER_PRODUCT
     sorted_primary = sorted(
         primary_search_results,
-        key=lambda item: item["distance"],
+        key=lambda item: item[distance_key],
         reverse=is_similarity_metric,
     )
 
@@ -158,13 +164,13 @@ def reciprocal_rank_fusion(
         doc_id = str(list(row.values())[0])
         if doc_id not in rrf_scores:
             rrf_scores[doc_id] = dict(row)
-            rrf_scores[doc_id]["distance"] = 0.0
-        rrf_scores[doc_id]["distance"] += 1.0 / (rank + rrf_k)
+            rrf_scores[doc_id][distance_key] = 0.0
+        rrf_scores[doc_id][distance_key] += 1.0 / (rank + rrf_k)
 
     # Keyword search relevance is always "higher is better" -> sort descending
     sorted_secondary = sorted(
         secondary_search_results,
-        key=lambda item: item["distance"],
+        key=lambda item: item[distance_key],
         reverse=True,
     )
 
@@ -172,11 +178,11 @@ def reciprocal_rank_fusion(
         doc_id = str(list(row.values())[0])
         if doc_id not in rrf_scores:
             rrf_scores[doc_id] = dict(row)
-            rrf_scores[doc_id]["distance"] = 0.0
-        rrf_scores[doc_id]["distance"] += 1.0 / (rank + rrf_k)
+            rrf_scores[doc_id][distance_key] = 0.0
+        rrf_scores[doc_id][distance_key] += 1.0 / (rank + rrf_k)
 
     ranked_results = sorted(
-        rrf_scores.values(), key=lambda item: item["distance"], reverse=True
+        rrf_scores.values(), key=lambda item: item[distance_key], reverse=True
     )
     return ranked_results[:fetch_top_k]
 

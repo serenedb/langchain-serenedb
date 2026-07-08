@@ -137,6 +137,24 @@ class AsyncSereneDBVectorStore(VectorStore):
         # aapply_vector_index / adrop_vector_index so the dense query need not probe
         # pg_indexes on every search.
         self._index_exists: Optional[bool] = None
+        # Output-column alias for the computed distance/score. "distance" unless a real
+        # column (id/content/embedding/json/metadata) already uses that name, in which
+        # case a non-colliding name is chosen so the SELECT has no duplicate output
+        # column (which would otherwise shadow the real column in the row dict).
+        self._distance_alias = self._unique_output_alias("distance")
+
+    def _unique_output_alias(self, base: str) -> str:
+        """Pick a result-column alias that doesn't collide with any selected column."""
+        reserved = {self.id_column, self.content_column, self.embedding_column}
+        reserved.update(self.metadata_columns)
+        if self.metadata_json_column:
+            reserved.add(self.metadata_json_column)
+        if base not in reserved:
+            return base
+        i = 1
+        while f"{base}_{i}" in reserved:
+            i += 1
+        return f"{base}_{i}"
 
     @property
     def embeddings(self) -> Embeddings:
@@ -519,7 +537,7 @@ class AsyncSereneDBVectorStore(VectorStore):
                 metadata=metadata,
                 id=str(row[self.id_column]),
             )
-            out.append((doc, row["distance"]) if with_score else doc)
+            out.append((doc, row[self._distance_alias]) if with_score else doc)
         return out
 
     async def _adense_query(
@@ -548,11 +566,12 @@ class AsyncSereneDBVectorStore(VectorStore):
         else:
             source = f'"{self.schema_name}"."{self.table_name}"'
 
+        alias = self._distance_alias
         query = (
             f"SELECT {column_names}, "
-            f'{search_function}("{self.embedding_column}", %(query_embedding)s::FLOAT[{dim}]) AS distance '
+            f'{search_function}("{self.embedding_column}", %(query_embedding)s::FLOAT[{dim}]) AS "{alias}" '
             f"FROM {source} {where_filters} "
-            f"ORDER BY distance "
+            f'ORDER BY "{alias}" '
             f"LIMIT %(dense_limit)s;"
         )
         params: dict[str, Any] = {
@@ -591,11 +610,12 @@ class AsyncSereneDBVectorStore(VectorStore):
 
         # Schema-qualify the index (a bare name does not resolve in a non-public schema);
         # the relation's implicit alias is the bare index name, so tableoid uses that.
+        alias = self._distance_alias
         query = (
-            f'SELECT {column_names}, {scorer}("{index_name}".tableoid) AS distance '
+            f'SELECT {column_names}, {scorer}("{index_name}".tableoid) AS "{alias}" '
             f'FROM "{schema_name}"."{index_name}" '
             f'WHERE "{self.content_column}" @@ {tsquery_fn}(%(fts_query)s) {and_filters} '
-            f'ORDER BY distance DESC, "{self.id_column}" '
+            f'ORDER BY "{alias}" DESC, "{self.id_column}" '
             f"LIMIT %(sparse_limit)s;"
         )
         params: dict[str, Any] = {"fts_query": fts_query, "sparse_limit": limit}
@@ -640,6 +660,7 @@ class AsyncSereneDBVectorStore(VectorStore):
                 sparse_rows,
                 **fusion_params,
                 distance_strategy=self.distance_strategy,
+                distance_key=self._distance_alias,
             )
             return list(combined)
         return dense_rows
@@ -771,7 +792,7 @@ class AsyncSereneDBVectorStore(VectorStore):
         rows = await self._aquery(query, params)
         # No distance column here; add a placeholder so the shared builder works.
         for row in rows:
-            row.setdefault("distance", 0.0)
+            row.setdefault(self._distance_alias, 0.0)
         docs = self._rows_to_documents(rows)
         # Return in the same order as the requested ids (VectorStore contract).
         by_id = {doc.id: doc for doc in docs}

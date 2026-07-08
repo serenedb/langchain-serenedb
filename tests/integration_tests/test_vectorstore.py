@@ -1117,3 +1117,74 @@ def test_explicit_unindexable_column_surfaces_db_error():
     finally:
         engine.drop_table(table)
         engine.close()
+
+
+# -- collision: a metadata column literally named "distance" ---------------------------
+
+
+def test_distance_named_metadata_column_dense():
+    """A metadata column named 'distance' must not be shadowed by the score alias."""
+    table = f"lc_dist_{uuid.uuid4().hex[:8]}"
+    engine = SereneDBEngine.from_connection_string(CONNINFO)
+    engine.init_vectorstore_table(
+        table,
+        DIM,
+        overwrite_existing=True,
+        metadata_columns=[Column("distance", "TEXT")],
+        vector_index=HNSWIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE),
+    )
+    vs = SereneDBVectorStore.create_sync(
+        engine,
+        DetEmb(),
+        table,
+        metadata_columns=["distance"],
+        distance_strategy=DistanceStrategy.COSINE_DISTANCE,
+    )
+    try:
+        vs.add_texts(
+            ["red", "blue"], metadatas=[{"distance": "far"}, {"distance": "near"}]
+        )
+        by_text = {
+            d.page_content: (d, s)
+            for d, s in vs.similarity_search_with_score("red", k=2)
+        }
+        # The 'distance' metadata value is preserved (not overwritten by the score)...
+        assert by_text["red"][0].metadata["distance"] == "far"
+        assert by_text["blue"][0].metadata["distance"] == "near"
+        # ...and the score is a real distance (~0 for the exact-text match).
+        assert by_text["red"][1] < 1e-6
+    finally:
+        engine.drop_table(table)
+        engine.close()
+
+
+def test_distance_named_metadata_column_hybrid():
+    """The same collision must be handled through the hybrid (RRF) fusion path."""
+    table = f"lc_disth_{uuid.uuid4().hex[:8]}"
+    engine = SereneDBEngine.from_connection_string(CONNINFO)
+    engine.init_vectorstore_table(
+        table,
+        DIM,
+        overwrite_existing=True,
+        metadata_columns=[Column("distance", "TEXT")],
+    )
+    cfg = HybridSearchConfig(
+        primary_top_k=10, secondary_top_k=10, fusion_function=reciprocal_rank_fusion
+    )
+    vs = SereneDBVectorStore.create_sync(
+        engine, DetEmb(), table, metadata_columns=["distance"], hybrid_search_config=cfg
+    )
+    try:
+        vs.add_texts(
+            ["the quick brown fox", "a lazy brown dog"],
+            metadatas=[{"distance": "far"}, {"distance": "near"}],
+        )
+        vs.apply_hybrid_search_index()
+        res = vs.similarity_search("brown", k=2)
+        assert res
+        # Metadata survives fusion; the fused score doesn't collide with the column.
+        assert all("distance" in d.metadata for d in res)
+        assert {d.metadata["distance"] for d in res} <= {"far", "near"}
+    finally:
+        engine.drop_table(table)
+        engine.close()
