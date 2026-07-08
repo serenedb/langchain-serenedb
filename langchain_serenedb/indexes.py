@@ -14,6 +14,7 @@ import enum
 import re
 import warnings
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -177,9 +178,115 @@ class HNSWQueryOptions(QueryOptions):
         return f"sdb_ef_search = {self.ef_search}"
 
 
+@dataclass
+class MetadataColumnIndex:
+    """An explicit (typed) metadata column to add to the inverted index.
+
+    ``dictionary=None`` indexes the column verbatim (one token per value), which is what
+    lets plain ``=`` / ``IN`` / range filters be served by the index scan. Attaching a
+    dictionary analyzes the column for full-text instead and defeats plain-equality
+    pushdown (such queries then require the ``@@`` operator).
+    """
+
+    name: str
+    dictionary: Optional[str] = None
+
+
+@dataclass
+class JsonFieldIndex:
+    """A JSON metadata sub-field to add to the inverted index.
+
+    ``field`` is the key, or dotted path (e.g. ``"attrs.brand"``), inside the JSON
+    metadata column. ``data_type`` is the SQL type the sub-field is indexed/queried as
+    (``"TEXT"``, ``"INTEGER"``, ``"DOUBLE"``, ``"BOOLEAN"``, ``"DATE"``, ...); it is NOT
+    validated here — an unsupported type surfaces the database's error at CREATE INDEX
+    time. The value is extracted with ``->>``; for non-``TEXT`` types a ``::data_type``
+    cast is applied to both the index entry and the query so the typed comparison pushes
+    into the index scan correctly (see :func:`build_json_field_selector`).
+    """
+
+    field: str
+    data_type: str
+    dictionary: Optional[str] = None
+
+
+@dataclass
+class MetadataIndexConfig:
+    """Which metadata to add to the inverted index so filters are index-covered.
+
+    ``columns=None`` (the default) indexes *all* declared metadata columns verbatim;
+    pass an explicit list to index a subset (each optionally with a dictionary), or an
+    empty list to index none. ``json_fields`` adds JSON metadata sub-fields (none by
+    default).
+    """
+
+    columns: Optional[list[MetadataColumnIndex]] = None
+    json_fields: list[JsonFieldIndex] = field(default_factory=list)
+
+
 def _quote_ident(name: str) -> str:
     """Escape and double-quote a SQL identifier."""
     return '"' + name.replace('"', '""') + '"'
+
+
+# Base SQL types SereneDB's inverted index accepts as a verbatim scalar member (verified
+# on serenedb 26.06.3). Used ONLY as a safety net for the default "index every metadata
+# column" case: an auto-selected column whose type is not in this set is silently skipped
+# so the auto-built index can't fail at CREATE INDEX. Explicitly configured columns are
+# NOT filtered — there the database decides. Notably unindexable: NUMERIC/DECIMAL/HUGEINT,
+# UUID, INTERVAL, VARIANT.
+INDEXABLE_METADATA_TYPES = frozenset(
+    {
+        "TEXT", "VARCHAR", "CHAR", "CHARACTER", "BPCHAR", "STRING",
+        "INT", "INTEGER", "INT2", "INT4", "INT8", "BIGINT", "SMALLINT", "TINYINT",
+        "BOOL", "BOOLEAN",
+        "REAL", "FLOAT", "FLOAT4", "FLOAT8", "DOUBLE",
+        "DATE", "TIME", "TIMETZ", "TIMESTAMP", "TIMESTAMPTZ",
+        "BYTEA", "BLOB",
+        "JSON",
+    }
+)  # fmt: skip
+
+
+def _normalize_sql_type(sql_type: str) -> str:
+    """Reduce a declared/reported SQL type to its leading base-type keyword.
+
+    Drops length/precision (``VARCHAR(50)`` → ``VARCHAR``) and trailing modifiers
+    (``DOUBLE PRECISION`` → ``DOUBLE``, ``timestamp without time zone`` → ``TIMESTAMP``).
+    """
+    token = sql_type.strip().upper().split("(", 1)[0].split()
+    return token[0] if token else ""
+
+
+def _is_indexable_metadata_type(sql_type: str) -> bool:
+    """Whether a metadata column of this SQL type can join the inverted index verbatim."""
+    return _normalize_sql_type(sql_type) in INDEXABLE_METADATA_TYPES
+
+
+def build_json_field_selector(json_column: str, field: str, data_type: str) -> str:
+    """Build the JSON sub-field extraction expression for indexing or querying.
+
+    The index expression and the query expression MUST be byte-identical — same arrow
+    *and* same cast — for SereneDB to serve the predicate from the index scan, so both
+    the CREATE INDEX entry and the WHERE clause go through this one function.
+
+    The value is extracted with the ``->>`` (text) leaf arrow. For non-``TEXT`` types a
+    ``::data_type`` cast is appended on *both* sides: the index then stores typed
+    tokens, so a pushed-down range/equality on the cast value is correct. (Indexing the
+    bare extraction and casting only in the query pushes down but returns wrong results
+    on SereneDB, because the index compares the raw string tokens against the cast bound.)
+    """
+    parts = field.split(".")
+    is_text = data_type.strip().upper() == "TEXT"
+    expr = _quote_ident(json_column)
+    for i, part in enumerate(parts):
+        leaf = i == len(parts) - 1
+        arrow = "->>" if leaf else "->"
+        expr += f"{arrow}'{part}'"
+    expr = f"({expr})"
+    if not is_text:
+        expr = f"{expr}::{data_type}"
+    return expr
 
 
 def build_dictionary_ddl(
@@ -196,6 +303,63 @@ def build_dictionary_ddl(
     return f"CREATE TEXT SEARCH DICTIONARY {ine}{qualified} ({options});"
 
 
+def build_metadata_index_entries(
+    metadata_index: Optional[MetadataIndexConfig],
+    *,
+    metadata_json_column: Optional[str],
+    metadata_columns: Mapping[str, Optional[str]],
+) -> list[str]:
+    """Render the extra ``USING inverted (...)`` entries for metadata columns + JSON.
+
+    ``metadata_columns`` maps each metadata column name to its SQL type (``None`` if
+    unknown). ``metadata_index=None`` indexes all of them verbatim (no JSON). Column
+    entries with no dictionary are verbatim (exact/range match); JSON entries use
+    :func:`build_json_field_selector` so they byte-match the query side.
+
+    When the column set is auto-derived (``metadata_index`` is ``None`` or its ``columns``
+    is ``None``), a column whose (known) type is not inverted-indexable is silently
+    skipped so the auto-built index can't fail at CREATE INDEX. Explicitly configured
+    columns are never filtered — there the database decides (an unindexable entry
+    surfaces its DDL error).
+    """
+
+    def _auto_cols() -> list[MetadataColumnIndex]:
+        return [
+            MetadataColumnIndex(name=name)
+            for name, sql_type in metadata_columns.items()
+            if sql_type is None or _is_indexable_metadata_type(sql_type)
+        ]
+
+    if metadata_index is None:
+        col_specs: list[MetadataColumnIndex] = _auto_cols()
+        json_specs: list[JsonFieldIndex] = []
+    else:
+        col_specs = (
+            _auto_cols() if metadata_index.columns is None else metadata_index.columns
+        )
+        json_specs = metadata_index.json_fields
+
+    entries: list[str] = []
+    for col in col_specs:
+        entry = _quote_ident(col.name)
+        if col.dictionary:
+            entry += f" {_quote_ident(col.dictionary)}"
+        entries.append(entry)
+
+    if json_specs and not metadata_json_column:
+        raise ValueError(
+            "Cannot index JSON metadata fields: the store has no JSON metadata column "
+            "(store_metadata=False)."
+        )
+    for jf in json_specs:
+        assert metadata_json_column is not None  # guaranteed by the check above
+        entry = build_json_field_selector(metadata_json_column, jf.field, jf.data_type)
+        if jf.dictionary:
+            entry += f" {_quote_ident(jf.dictionary)}"
+        entries.append(entry)
+    return entries
+
+
 def build_vector_index_ddl(
     *,
     schema_name: str,
@@ -203,18 +367,24 @@ def build_vector_index_ddl(
     embedding_column: str,
     index_name: str,
     hnsw_options: str,
+    metadata_entries: Optional[list[str]] = None,
     if_not_exists: bool = False,
 ) -> str:
-    """CREATE INDEX for a vector-only HNSW inverted index on the embedding column.
+    """CREATE INDEX for a vector HNSW inverted index on the embedding column.
 
     ``hnsw_options`` is the operator-class spec produced by :meth:`HNSWIndex.index_options`,
-    e.g. ``hnsw (metric = 'cosine', m = 16, ef_construction = 64)``.
+    e.g. ``hnsw (metric = 'cosine', m = 16, ef_construction = 64)``. ``metadata_entries``
+    (from :func:`build_metadata_index_entries`) are appended so metadata filters can be
+    served by the index scan.
     """
     ine = "IF NOT EXISTS " if if_not_exists else ""
+    columns = f"{_quote_ident(embedding_column)} {hnsw_options}"
+    if metadata_entries:
+        columns += ", " + ", ".join(metadata_entries)
     return (
         f"CREATE INDEX {ine}{_quote_ident(index_name)} "
         f"ON {_quote_ident(schema_name)}.{_quote_ident(table_name)} "
-        f"USING inverted ({_quote_ident(embedding_column)} {hnsw_options});"
+        f"USING inverted ({columns});"
     )
 
 
@@ -228,17 +398,25 @@ def build_hybrid_index_ddl(
     index_name: str,
     dictionary_name: str,
     hnsw_options: str,
+    metadata_entries: Optional[list[str]] = None,
     if_not_exists: bool = True,
 ) -> str:
     """CREATE INDEX for one combined inverted index covering the content column
     (analyzed for BM25 full-text) and the embedding column (HNSW), storing the id via
-    ``INCLUDE`` so the lexical branch can return it.
+    ``INCLUDE`` so the lexical branch can return it. ``metadata_entries`` (from
+    :func:`build_metadata_index_entries`) are appended so metadata filters can be served
+    by the index scan.
     """
     ine = "IF NOT EXISTS " if if_not_exists else ""
+    columns = (
+        f"{_quote_ident(content_column)} {_quote_ident(dictionary_name)}, "
+        f"{_quote_ident(embedding_column)} {hnsw_options}"
+    )
+    if metadata_entries:
+        columns += ", " + ", ".join(metadata_entries)
     return (
         f"CREATE INDEX {ine}{_quote_ident(index_name)} "
         f"ON {_quote_ident(schema_name)}.{_quote_ident(table_name)} "
-        f"USING inverted ({_quote_ident(content_column)} {_quote_ident(dictionary_name)}, "
-        f"{_quote_ident(embedding_column)} {hnsw_options}) "
+        f"USING inverted ({columns}) "
         f"INCLUDE ({_quote_ident(id_column)});"
     )

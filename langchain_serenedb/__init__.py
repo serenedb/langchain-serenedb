@@ -18,6 +18,9 @@ from langchain_serenedb.indexes import (
     DistanceStrategy,
     HNSWIndex,
     HNSWQueryOptions,
+    JsonFieldIndex,
+    MetadataColumnIndex,
+    MetadataIndexConfig,
 )
 from langchain_serenedb.vectorstores import SereneDBVectorStore
 
@@ -36,6 +39,9 @@ __all__ = [
     "HNSWIndex",
     "HNSWQueryOptions",
     "HybridSearchConfig",
+    "JsonFieldIndex",
+    "MetadataColumnIndex",
+    "MetadataIndexConfig",
     "SereneDBEngine",
     "SereneDBVectorStore",
     "reciprocal_rank_fusion",

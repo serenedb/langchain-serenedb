@@ -21,8 +21,10 @@ from .indexes import (
     BaseIndex,
     ExactNearestNeighbor,
     HNSWIndex,
+    MetadataIndexConfig,
     build_dictionary_ddl,
     build_hybrid_index_ddl,
+    build_metadata_index_entries,
     build_vector_index_ddl,
 )
 
@@ -248,6 +250,7 @@ class SereneDBEngine:
         store_metadata: bool = True,
         vector_index: Optional[BaseIndex] = None,
         hybrid_search_config: Optional[HybridSearchConfig] = None,
+        metadata_index: Optional[MetadataIndexConfig] = None,
     ) -> None:
         """Create a table for storing vectors, for use with SereneDBVectorStore.
 
@@ -261,6 +264,11 @@ class SereneDBEngine:
         It does NOT reconcile an existing table's shape — if a table with this name
         already exists, its columns are left as-is (use :meth:`create` to validate them).
         Mutually exclusive with ``overwrite_existing`` (which drops and recreates).
+
+        When an index is built, ``metadata_index`` controls which metadata columns / JSON
+        sub-fields are added to it so metadata filters are served by the index scan. The
+        default (``None``) indexes all declared ``metadata_columns`` verbatim and no JSON;
+        pass a :class:`~langchain_serenedb.indexes.MetadataIndexConfig` to override.
         """
         if overwrite_existing and if_not_exists:
             raise ValueError(
@@ -280,13 +288,19 @@ class SereneDBEngine:
 
         if metadata_columns is None:
             metadata_columns = []
-        else:
-            for col in metadata_columns:
-                if isinstance(col, Column):
-                    col.name = self._escape_identifier(col.name)
-                elif isinstance(col, dict):
-                    self._validate_column_dict(col)
-                    col["name"] = self._escape_identifier(col["name"])
+        # Capture raw (un-escaped) metadata column names mapped to their declared types
+        # for the index-DDL builder (which escapes internally, and uses the types to skip
+        # unindexable columns in the default index-all case), then escape the names in
+        # place for the CREATE TABLE.
+        raw_metadata_columns: dict[str, str] = {}
+        for col in metadata_columns:
+            if isinstance(col, Column):
+                raw_metadata_columns[col.name] = col.data_type
+                col.name = self._escape_identifier(col.name)
+            elif isinstance(col, dict):
+                self._validate_column_dict(col)
+                raw_metadata_columns[col["name"]] = col["data_type"]
+                col["name"] = self._escape_identifier(col["name"])
 
         if isinstance(id_column, str):
             raw_id_column_name = id_column
@@ -346,6 +360,11 @@ class SereneDBEngine:
                 else HNSWIndex()
             )
             hnsw_options = index.index_options()
+            metadata_entries = build_metadata_index_entries(
+                metadata_index,
+                metadata_json_column=metadata_json_column if store_metadata else None,
+                metadata_columns=raw_metadata_columns,
+            )
             if hybrid_search_config is not None:
                 await self._aexecute(
                     build_dictionary_ddl(
@@ -364,6 +383,7 @@ class SereneDBEngine:
                         index_name=raw_table_name + DEFAULT_INDEX_NAME_SUFFIX,
                         dictionary_name=hybrid_search_config.dictionary_name,
                         hnsw_options=hnsw_options,
+                        metadata_entries=metadata_entries,
                         if_not_exists=if_not_exists,
                     )
                 )
@@ -375,6 +395,7 @@ class SereneDBEngine:
                         embedding_column=raw_embedding_column,
                         index_name=raw_table_name + DEFAULT_INDEX_NAME_SUFFIX,
                         hnsw_options=hnsw_options,
+                        metadata_entries=metadata_entries,
                         if_not_exists=if_not_exists,
                     )
                 )
@@ -395,6 +416,7 @@ class SereneDBEngine:
         store_metadata: bool = True,
         vector_index: Optional[BaseIndex] = None,
         hybrid_search_config: Optional[HybridSearchConfig] = None,
+        metadata_index: Optional[MetadataIndexConfig] = None,
     ) -> None:
         """Async: create a table for storing vectors.
 
@@ -403,6 +425,9 @@ class SereneDBEngine:
         combined full-text + vector index — both in the same call as table creation.
         ``if_not_exists=True`` makes the call idempotent (create only when absent; keeps
         existing data); it is mutually exclusive with ``overwrite_existing``.
+        ``metadata_index`` (a :class:`~langchain_serenedb.indexes.MetadataIndexConfig`)
+        selects which metadata columns / JSON sub-fields join the index for filter
+        pushdown; the default indexes all declared ``metadata_columns`` verbatim.
         """
         await self._run_as_async(
             self._ainit_vectorstore_table(
@@ -419,6 +444,7 @@ class SereneDBEngine:
                 store_metadata=store_metadata,
                 vector_index=vector_index,
                 hybrid_search_config=hybrid_search_config,
+                metadata_index=metadata_index,
             )
         )
 
@@ -438,6 +464,7 @@ class SereneDBEngine:
         store_metadata: bool = True,
         vector_index: Optional[BaseIndex] = None,
         hybrid_search_config: Optional[HybridSearchConfig] = None,
+        metadata_index: Optional[MetadataIndexConfig] = None,
     ) -> None:
         """Sync: create a table for storing vectors.
 
@@ -446,6 +473,9 @@ class SereneDBEngine:
         combined full-text + vector index — both in the same call as table creation.
         ``if_not_exists=True`` makes the call idempotent (create only when absent; keeps
         existing data); it is mutually exclusive with ``overwrite_existing``.
+        ``metadata_index`` (a :class:`~langchain_serenedb.indexes.MetadataIndexConfig`)
+        selects which metadata columns / JSON sub-fields join the index for filter
+        pushdown; the default indexes all declared ``metadata_columns`` verbatim.
         """
         self._run_as_sync(
             self._ainit_vectorstore_table(
@@ -462,6 +492,7 @@ class SereneDBEngine:
                 store_metadata=store_metadata,
                 vector_index=vector_index,
                 hybrid_search_config=hybrid_search_config,
+                metadata_index=metadata_index,
             )
         )
 

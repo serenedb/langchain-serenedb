@@ -21,6 +21,7 @@ from .indexes import (
     DEFAULT_DISTANCE_STRATEGY,
     BaseIndex,
     DistanceStrategy,
+    MetadataIndexConfig,
     QueryOptions,
 )
 
@@ -63,6 +64,7 @@ class SereneDBVectorStore(VectorStore):
         lambda_mult: float = 0.5,
         index_query_options: Optional[QueryOptions] = None,
         hybrid_search_config: Optional[HybridSearchConfig] = None,
+        metadata_index: Optional[MetadataIndexConfig] = None,
         sync_load: bool = True,
     ) -> SereneDBVectorStore:
         """Async factory that builds the sync store (validating the table).
@@ -87,6 +89,7 @@ class SereneDBVectorStore(VectorStore):
             lambda_mult=lambda_mult,
             index_query_options=index_query_options,
             hybrid_search_config=hybrid_search_config,
+            metadata_index=metadata_index,
             sync_load=sync_load,
         )
         vs = await engine._run_as_async(coro)

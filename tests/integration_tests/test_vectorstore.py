@@ -18,9 +18,16 @@ from langchain_serenedb import (
     DistanceStrategy,
     HNSWIndex,
     HybridSearchConfig,
+    JsonFieldIndex,
+    MetadataColumnIndex,
+    MetadataIndexConfig,
     SereneDBEngine,
     SereneDBVectorStore,
     reciprocal_rank_fusion,
+)
+from langchain_serenedb.indexes import (
+    DEFAULT_INDEX_NAME_SUFFIX,
+    build_json_field_selector,
 )
 
 CONNINFO = os.environ.get(
@@ -803,6 +810,310 @@ def test_sync_load_false_then_manual_refresh():
         engine.refresh_table(table)  # caller publishes explicitly; must not raise
         after = [d.page_content for d in vs.similarity_search("alpha", k=5)]
         assert "alpha" in after
+    finally:
+        engine.drop_table(table)
+        engine.close()
+
+
+# -- metadata-column / JSON-field indexing (filter pushdown) ---------------------------
+
+JSON_COL = "langchain_metadata"
+
+# One data set reused by both the indexed and control stores. ``category`` is a typed
+# column; ``n`` (int) and ``tag`` (text) live in the JSON metadata column.
+_MI_TEXTS = ["the quick brown fox", "a lazy dog", "quantum physics", "linear algebra"]
+_MI_METAS = [
+    {"category": "animal", "n": 1, "tag": "t0"},
+    {"category": "animal", "n": 2, "tag": "t1"},
+    {"category": "science", "n": 3, "tag": "t2"},
+    {"category": "science", "n": 4, "tag": "t0"},
+]
+
+
+def _make_indexed_store(metadata_index):
+    """Create a table + store with the given ``metadata_index``, load data, index it."""
+    table = f"lc_mi_{uuid.uuid4().hex[:8]}"
+    engine = SereneDBEngine.from_connection_string(CONNINFO)
+    engine.init_vectorstore_table(
+        table,
+        DIM,
+        overwrite_existing=True,
+        metadata_columns=[Column("category", "TEXT")],
+    )
+    vs = SereneDBVectorStore.create_sync(
+        engine,
+        DetEmb(),
+        table,
+        metadata_columns=["category"],
+        distance_strategy=DistanceStrategy.COSINE_DISTANCE,
+        metadata_index=metadata_index,
+    )
+    vs.add_texts(_MI_TEXTS, metadatas=_MI_METAS)
+    vs.apply_vector_index(HNSWIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE))
+    return vs, engine, table
+
+
+def _explain_where(table, where_sql):
+    """Return the EXPLAIN plan text for a dense query, from the index, with ``where_sql``."""
+    index_name = table + DEFAULT_INDEX_NAME_SUFFIX
+    query = (
+        f'EXPLAIN SELECT "langchain_id", '
+        f'l2_distance("embedding", %(q)s::FLOAT[{DIM}]) AS distance '
+        f'FROM "public"."{index_name}" WHERE {where_sql} '
+        f"ORDER BY distance LIMIT 5"
+    )
+    with psycopg.connect(CONNINFO, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(query, {"q": [0.1] * DIM})
+        return "\n".join(row[0] for row in cur.fetchall())
+
+
+def _has_standalone_filter(plan_text):
+    """Whether the plan has a standalone FILTER node (predicate NOT pushed into the scan).
+
+    SereneDB renders the plan as boxes; a post-filter shows a box whose sole title line
+    is ``FILTER``. A pushed-down predicate instead appears as a ``TextFilter`` /
+    ``Term`` / ``GranularRange`` block *inside* the ``IRESEARCH_SCAN`` box.
+    """
+    return any(line.strip().strip("│ ") == "FILTER" for line in plan_text.splitlines())
+
+
+# The declared-JSON query expressions must match how the index was built (arrow + cast).
+_JSON_N_EXPR = build_json_field_selector(JSON_COL, "n", "INTEGER")
+_JSON_TAG_EXPR = build_json_field_selector(JSON_COL, "tag", "TEXT")
+
+_PUSHDOWN_CASES = [
+    ("typed eq", "\"category\" = 'animal'"),
+    ("typed in", "\"category\" IN ('animal', 'science')"),
+    ("typed range", "\"category\" > 'b'"),
+    ("json text eq", f"{_JSON_TAG_EXPR} = 't1'"),
+    ("json numeric range", f"{_JSON_N_EXPR} >= 3"),
+]
+
+
+@pytest.fixture
+def indexed_store():
+    """Store whose index covers the ``category`` column (verbatim) and JSON ``n``/``tag``."""
+    vs, engine, table = _make_indexed_store(
+        MetadataIndexConfig(
+            json_fields=[
+                JsonFieldIndex("n", "INTEGER"),
+                JsonFieldIndex("tag", "TEXT"),
+            ]
+        )
+    )
+    try:
+        yield vs, table
+    finally:
+        engine.drop_table(table)
+        engine.close()
+
+
+@pytest.fixture
+def unindexed_store():
+    """Control store: ``columns=[]`` and no JSON fields, so nothing extra is indexed."""
+    vs, engine, table = _make_indexed_store(MetadataIndexConfig(columns=[]))
+    try:
+        yield vs, table
+    finally:
+        engine.drop_table(table)
+        engine.close()
+
+
+@pytest.mark.parametrize(
+    "label,where_sql", _PUSHDOWN_CASES, ids=[c[0] for c in _PUSHDOWN_CASES]
+)
+def test_metadata_filter_pushed_into_index_scan(indexed_store, label, where_sql):
+    """With the column/field indexed, the predicate compiles INTO the IRESEARCH_SCAN."""
+    _, table = indexed_store
+    plan = _explain_where(table, where_sql)
+    assert "IRESEARCH_SCAN" in plan
+    assert not _has_standalone_filter(plan), f"{label} should push down, got:\n{plan}"
+
+
+@pytest.mark.parametrize(
+    "label,where_sql", _PUSHDOWN_CASES, ids=[c[0] for c in _PUSHDOWN_CASES]
+)
+def test_metadata_filter_is_post_filter_without_index(
+    unindexed_store, label, where_sql
+):
+    """Control: with nothing indexed the same predicate runs as a standalone FILTER."""
+    _, table = unindexed_store
+    plan = _explain_where(table, where_sql)
+    assert _has_standalone_filter(plan), (
+        f"{label} should be a post-filter, got:\n{plan}"
+    )
+
+
+_PARITY_FILTERS = [
+    {"category": "animal"},
+    {"category": {"$in": ["animal", "science"]}},
+    {"category": {"$ne": "animal"}},
+    {"n": {"$gte": 3}},
+    {"n": {"$between": [2, 3]}},
+    {"tag": "t0"},
+    {"tag": {"$in": ["t1", "t2"]}},
+    {"$and": [{"category": "science"}, {"n": {"$gte": 4}}]},
+    {"$or": [{"tag": "t2"}, {"n": {"$lte": 1}}]},
+]
+
+
+@pytest.mark.parametrize("filt", _PARITY_FILTERS)
+def test_indexed_and_unindexed_return_identical_rows(
+    indexed_store, unindexed_store, filt
+):
+    """Indexing metadata is a pure optimization: results must be identical either way."""
+    indexed_vs, _ = indexed_store
+    control_vs, _ = unindexed_store
+    got_indexed = sorted(
+        d.page_content for d in indexed_vs.similarity_search("x", k=10, filter=filt)
+    )
+    got_control = sorted(
+        d.page_content for d in control_vs.similarity_search("x", k=10, filter=filt)
+    )
+    assert got_indexed == got_control
+
+
+def test_indexed_json_filter_returns_expected_rows(indexed_store):
+    """Sanity: the declared-JSON filter path (arrow + cast) returns the right rows."""
+    vs, _ = indexed_store
+    res = vs.similarity_search("x", k=10, filter={"n": {"$gte": 3}})
+    assert sorted(d.page_content for d in res) == ["linear algebra", "quantum physics"]
+    res = vs.similarity_search("x", k=10, filter={"tag": "t0"})
+    assert sorted(d.page_content for d in res) == [
+        "linear algebra",
+        "the quick brown fox",
+    ]
+
+
+def test_metadata_index_columns_subset():
+    """An explicit column subset is accepted and still pushes the typed-column filter."""
+    # Build a store that indexes only ``category`` explicitly (no JSON), verifying the
+    # MetadataColumnIndex path and that a subset still pushes the typed-column filter.
+    vs, engine, table = _make_indexed_store(
+        MetadataIndexConfig(columns=[MetadataColumnIndex("category")])
+    )
+    try:
+        plan = _explain_where(table, "\"category\" = 'animal'")
+        assert "IRESEARCH_SCAN" in plan
+        assert not _has_standalone_filter(plan)
+        res = vs.similarity_search("x", k=10, filter={"category": "animal"})
+        assert sorted(d.page_content for d in res) == [
+            "a lazy dog",
+            "the quick brown fox",
+        ]
+    finally:
+        engine.drop_table(table)
+        engine.close()
+
+
+# -- safety net: default index-all silently skips unindexable column types -------------
+
+
+def test_default_index_skips_unindexable_column_at_table_creation():
+    """Building the index with the table must not fail on an unindexable column type.
+
+    ``price`` is DECIMAL (not inverted-indexable); the default index-all case skips it
+    silently, while ``category`` (TEXT) is still indexed and pushes down.
+    """
+    table = f"lc_mi_skip_{uuid.uuid4().hex[:8]}"
+    engine = SereneDBEngine.from_connection_string(CONNINFO)
+    engine.init_vectorstore_table(
+        table,
+        DIM,
+        overwrite_existing=True,
+        metadata_columns=[Column("category", "TEXT"), Column("price", "DECIMAL(10,2)")],
+        vector_index=HNSWIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE),
+    )  # must NOT raise despite the DECIMAL column
+    vs = SereneDBVectorStore.create_sync(
+        engine,
+        DetEmb(),
+        table,
+        metadata_columns=["category", "price"],
+        distance_strategy=DistanceStrategy.COSINE_DISTANCE,
+    )
+    try:
+        assert vs.is_valid_index() is True
+        vs.add_texts(
+            ["a", "b"],
+            metadatas=[
+                {"category": "x", "price": 1.5},
+                {"category": "y", "price": 2.5},
+            ],
+        )
+        # category was indexed (pushes down); price was skipped (post-filter). Both correct.
+        assert "IRESEARCH_SCAN" in _explain_where(table, "\"category\" = 'x'")
+        assert not _has_standalone_filter(_explain_where(table, "\"category\" = 'x'"))
+        assert _has_standalone_filter(_explain_where(table, '"price" = 1.5'))
+        assert [
+            d.page_content
+            for d in vs.similarity_search("a", k=5, filter={"category": "x"})
+        ] == ["a"]
+        assert [
+            d.page_content
+            for d in vs.similarity_search("a", k=5, filter={"price": 1.5})
+        ] == ["a"]
+    finally:
+        engine.drop_table(table)
+        engine.close()
+
+
+def test_default_index_skips_unindexable_column_at_apply():
+    """The same safety net applies when the index is built later via apply_vector_index.
+
+    Here the column type comes from information_schema (the store's own lookup), not from
+    a user-declared Column, exercising the second code path.
+    """
+    table = f"lc_mi_skip2_{uuid.uuid4().hex[:8]}"
+    engine = SereneDBEngine.from_connection_string(CONNINFO)
+    engine.init_vectorstore_table(
+        table,
+        DIM,
+        overwrite_existing=True,
+        metadata_columns=[Column("category", "TEXT"), Column("price", "DECIMAL(10,2)")],
+    )
+    vs = SereneDBVectorStore.create_sync(
+        engine,
+        DetEmb(),
+        table,
+        metadata_columns=["category", "price"],
+        distance_strategy=DistanceStrategy.COSINE_DISTANCE,
+    )
+    try:
+        vs.add_texts(["a", "b"], metadatas=[{"category": "x"}, {"category": "y"}])
+        # Default (metadata_index=None): must not raise; skips the DECIMAL column.
+        vs.apply_vector_index(
+            HNSWIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE)
+        )
+        assert vs.is_valid_index() is True
+        assert not _has_standalone_filter(_explain_where(table, "\"category\" = 'x'"))
+    finally:
+        engine.drop_table(table)
+        engine.close()
+
+
+def test_explicit_unindexable_column_surfaces_db_error():
+    """An explicitly configured column is trusted: the DB's CREATE INDEX error surfaces."""
+    table = f"lc_mi_err_{uuid.uuid4().hex[:8]}"
+    engine = SereneDBEngine.from_connection_string(CONNINFO)
+    engine.init_vectorstore_table(
+        table,
+        DIM,
+        overwrite_existing=True,
+        metadata_columns=[Column("price", "DECIMAL(10,2)")],
+    )
+    vs = SereneDBVectorStore.create_sync(
+        engine,
+        DetEmb(),
+        table,
+        metadata_columns=["price"],
+        distance_strategy=DistanceStrategy.COSINE_DISTANCE,
+        metadata_index=MetadataIndexConfig(columns=[MetadataColumnIndex("price")]),
+    )
+    try:
+        with pytest.raises(Exception):
+            vs.apply_vector_index(
+                HNSWIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE)
+            )
     finally:
         engine.drop_table(table)
         engine.close()

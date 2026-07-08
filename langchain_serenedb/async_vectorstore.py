@@ -37,9 +37,13 @@ from .indexes import (
     BaseIndex,
     DistanceStrategy,
     ExactNearestNeighbor,
+    JsonFieldIndex,
+    MetadataIndexConfig,
     QueryOptions,
     build_dictionary_ddl,
     build_hybrid_index_ddl,
+    build_json_field_selector,
+    build_metadata_index_entries,
     build_vector_index_ddl,
 )
 
@@ -88,7 +92,7 @@ class AsyncSereneDBVectorStore(VectorStore):
         schema_name: str = "public",
         content_column: str = "content",
         embedding_column: str = "embedding",
-        metadata_columns: Optional[list[str]] = None,
+        metadata_columns: Optional[dict[str, Optional[str]]] = None,
         id_column: str = "langchain_id",
         metadata_json_column: Optional[str] = "langchain_metadata",
         distance_strategy: DistanceStrategy = DEFAULT_DISTANCE_STRATEGY,
@@ -97,6 +101,7 @@ class AsyncSereneDBVectorStore(VectorStore):
         lambda_mult: float = 0.5,
         index_query_options: Optional[QueryOptions] = None,
         hybrid_search_config: Optional[HybridSearchConfig] = None,
+        metadata_index: Optional[MetadataIndexConfig] = None,
         sync_load: bool = True,
     ) -> None:
         if key != AsyncSereneDBVectorStore.__create_key:
@@ -109,7 +114,10 @@ class AsyncSereneDBVectorStore(VectorStore):
         self.schema_name = schema_name
         self.content_column = content_column
         self.embedding_column = embedding_column
-        self.metadata_columns = metadata_columns if metadata_columns is not None else []
+        # Ordered mapping of metadata column name -> declared SQL type (``None`` if
+        # unknown). Iterating / membership-testing yields the names, as before; the type
+        # lets the default index-all case skip columns the inverted index can't accept.
+        self.metadata_columns = metadata_columns if metadata_columns is not None else {}
         self.id_column = id_column
         self.metadata_json_column = metadata_json_column
         self.distance_strategy = distance_strategy
@@ -118,6 +126,10 @@ class AsyncSereneDBVectorStore(VectorStore):
         self.lambda_mult = lambda_mult
         self.index_query_options = index_query_options
         self.hybrid_search_config = hybrid_search_config
+        # Which metadata columns / JSON sub-fields are (or will be) added to the
+        # inverted index; consulted by the filter translator so a declared JSON field's
+        # query expression matches its indexed expression (arrow + cast).
+        self.metadata_index = metadata_index
         # When False, writes do NOT auto-refresh the inverted index; the caller is
         # responsible for calling refresh_table() to publish them (faster bulk loads).
         self.sync_load = sync_load
@@ -203,6 +215,7 @@ class AsyncSereneDBVectorStore(VectorStore):
         lambda_mult: float = 0.5,
         index_query_options: Optional[QueryOptions] = None,
         hybrid_search_config: Optional[HybridSearchConfig] = None,
+        metadata_index: Optional[MetadataIndexConfig] = None,
         sync_load: bool = True,
     ) -> AsyncSereneDBVectorStore:
         """Create an ``AsyncSereneDBVectorStore`` bound to an existing table.
@@ -271,6 +284,11 @@ class AsyncSereneDBVectorStore(VectorStore):
             del all_columns[embedding_column]
             metadata_columns = list(all_columns.keys())
 
+        # Map each metadata column to its reported SQL type (from information_schema), so
+        # the default index-all case can skip columns whose type the inverted index can't
+        # accept.
+        metadata_columns_with_types = {c: columns.get(c) for c in metadata_columns}
+
         return cls(
             cls.__create_key,
             engine,
@@ -279,7 +297,7 @@ class AsyncSereneDBVectorStore(VectorStore):
             schema_name=schema_name,
             content_column=content_column,
             embedding_column=embedding_column,
-            metadata_columns=metadata_columns,
+            metadata_columns=metadata_columns_with_types,
             id_column=id_column,
             metadata_json_column=metadata_json_column,
             distance_strategy=distance_strategy,
@@ -288,6 +306,7 @@ class AsyncSereneDBVectorStore(VectorStore):
             lambda_mult=lambda_mult,
             index_query_options=index_query_options,
             hybrid_search_config=hybrid_search_config,
+            metadata_index=metadata_index,
             sync_load=sync_load,
         )
 
@@ -472,7 +491,7 @@ class AsyncSereneDBVectorStore(VectorStore):
         columns = [self.id_column, self.content_column]
         if include_embedding:
             columns.append(self.embedding_column)
-        columns += self.metadata_columns
+        columns += list(self.metadata_columns)
         if self.metadata_json_column:
             columns.append(self.metadata_json_column)
         return ", ".join(f'"{col}"' for col in columns)
@@ -512,7 +531,6 @@ class AsyncSereneDBVectorStore(VectorStore):
     ) -> list[dict[str, Any]]:
         """Run a dense (ANN) similarity query and return raw rows with a distance."""
         dim = len(embedding)
-        operator = self.distance_strategy.operator
         search_function = self.distance_strategy.search_function
         column_names = self._select_columns()
 
@@ -534,7 +552,7 @@ class AsyncSereneDBVectorStore(VectorStore):
             f"SELECT {column_names}, "
             f'{search_function}("{self.embedding_column}", %(query_embedding)s::FLOAT[{dim}]) AS distance '
             f"FROM {source} {where_filters} "
-            f'ORDER BY "{self.embedding_column}" {operator} %(query_embedding)s::FLOAT[{dim}] '
+            f"ORDER BY distance "
             f"LIMIT %(dense_limit)s;"
         )
         params: dict[str, Any] = {
@@ -792,6 +810,11 @@ class AsyncSereneDBVectorStore(VectorStore):
             index.distance_strategy = self.distance_strategy
         hnsw_options = index.index_options()
         index_name = self._vector_index_name
+        metadata_entries = build_metadata_index_entries(
+            self.metadata_index,
+            metadata_json_column=self.metadata_json_column,
+            metadata_columns=self.metadata_columns,
+        )
 
         if self.hybrid_search_config:
             await self._acreate_text_search_dictionary(self.hybrid_search_config)
@@ -804,6 +827,7 @@ class AsyncSereneDBVectorStore(VectorStore):
                 index_name=index_name,
                 dictionary_name=self.hybrid_search_config.dictionary_name,
                 hnsw_options=hnsw_options,
+                metadata_entries=metadata_entries,
             )
         else:
             stmt = build_vector_index_ddl(
@@ -812,6 +836,7 @@ class AsyncSereneDBVectorStore(VectorStore):
                 embedding_column=self.embedding_column,
                 index_name=index_name,
                 hnsw_options=hnsw_options,
+                metadata_entries=metadata_entries,
             )
         await self.engine._aexecute(stmt)
         self._index_exists = True
@@ -860,6 +885,21 @@ class AsyncSereneDBVectorStore(VectorStore):
 
     # -- filter translation ----------------------------------------------------------
 
+    def _declared_json_field(self, field: str) -> Optional[JsonFieldIndex]:
+        """Return the ``JsonFieldIndex`` declared for ``field``, or ``None``.
+
+        A JSON sub-field added to the inverted index (via ``metadata_index.json_fields``)
+        must be filtered with the *same* arrow/cast the index used, or the predicate
+        won't push into the index scan. This tells the filter translator which fields
+        are declared (and with what SQL type).
+        """
+        if self.metadata_index is None:
+            return None
+        for json_field in self.metadata_index.json_fields:
+            if json_field.field == field:
+                return json_field
+        return None
+
     def _handle_field_filter(self, *, field: str, value: Any) -> tuple[str, dict]:
         """Translate a single field filter to a SereneDB WHERE clause fragment."""
         if not isinstance(field, str):
@@ -905,31 +945,44 @@ class AsyncSereneDBVectorStore(VectorStore):
             and field_column
             not in (self.id_column, self.content_column, self.embedding_column)
         )
-        if is_json_field:
-            field_selector = f"{self.metadata_json_column}.{field_selector}"
 
-        if "." in field_selector:
-            n_dots = field_selector.count(".")
-            field_selector = "->".join(
-                part if ind == 0 else f"{'>' if ind == n_dots else ''}'{part}'"
-                for ind, part in enumerate(field_selector.split("."))
+        declared_json = self._declared_json_field(field) if is_json_field else None
+        if declared_json is not None:
+            # Declared JSON field: emit the exact expression the index was built with
+            # ('->>' extraction, plus the declared cast for non-TEXT types) so the
+            # predicate pushes into the index scan instead of running as a post-filter.
+            assert self.metadata_json_column is not None
+            field_selector = build_json_field_selector(
+                self.metadata_json_column,
+                field,
+                declared_json.data_type,
             )
-            value_type = (
-                type(filter_value[0])
-                if isinstance(filter_value, (list, tuple)) and filter_value
-                else type(filter_value)
-            )
-            sdb_type = PYTHON_TO_SDB_TYPE_MAP.get(value_type)
-            if sdb_type is None:
-                raise ValueError(f"Unsupported type: {value_type}")
-            # SereneDB: '->' is low-precedence, so the extraction MUST be parenthesized
-            # before any comparison, whether or not a cast follows.
-            if sdb_type != "TEXT" and operator != "$exists":
-                field_selector = f"({field_selector})::{sdb_type}"
-            else:
-                field_selector = f"({field_selector})"
         else:
-            field_selector = f'"{field_selector}"'
+            if is_json_field:
+                field_selector = f"{self.metadata_json_column}.{field_selector}"
+
+            if "." in field_selector:
+                n_dots = field_selector.count(".")
+                field_selector = "->".join(
+                    part if ind == 0 else f"{'>' if ind == n_dots else ''}'{part}'"
+                    for ind, part in enumerate(field_selector.split("."))
+                )
+                value_type = (
+                    type(filter_value[0])
+                    if isinstance(filter_value, (list, tuple)) and filter_value
+                    else type(filter_value)
+                )
+                sdb_type = PYTHON_TO_SDB_TYPE_MAP.get(value_type)
+                if sdb_type is None:
+                    raise ValueError(f"Unsupported type: {value_type}")
+                # SereneDB: '->' is low-precedence, so the extraction MUST be
+                # parenthesized before any comparison, whether or not a cast follows.
+                if sdb_type != "TEXT" and operator != "$exists":
+                    field_selector = f"({field_selector})::{sdb_type}"
+                else:
+                    field_selector = f"({field_selector})"
+            else:
+                field_selector = f'"{field_selector}"'
 
         suffix_id = str(uuid.uuid4()).split("-")[0]
 
