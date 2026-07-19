@@ -1,7 +1,7 @@
 """LangChain integration for SereneDB.
 
 SereneDB speaks the PostgreSQL wire protocol; this package connects with psycopg3 and
-provides a LangChain vector store over SereneDB's native ``FLOAT[N]`` vectors, HNSW
+provides a LangChain vector store over SereneDB's native ``FLOAT[N]`` vectors, IVF
 inverted index, and BM25 full-text search.
 """
 
@@ -16,8 +16,8 @@ from langchain_serenedb.hybrid_search_config import (
 )
 from langchain_serenedb.indexes import (
     DistanceStrategy,
-    HNSWIndex,
-    HNSWQueryOptions,
+    IVFIndex,
+    IVFQueryOptions,
     JsonFieldIndex,
     MetadataColumnIndex,
     MetadataIndexConfig,
@@ -36,9 +36,9 @@ __all__ = [
     "Column",
     "ColumnDict",
     "DistanceStrategy",
-    "HNSWIndex",
-    "HNSWQueryOptions",
     "HybridSearchConfig",
+    "IVFIndex",
+    "IVFQueryOptions",
     "JsonFieldIndex",
     "MetadataColumnIndex",
     "MetadataIndexConfig",

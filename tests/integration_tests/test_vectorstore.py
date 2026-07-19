@@ -16,8 +16,9 @@ from langchain_core.embeddings import Embeddings
 from langchain_serenedb import (
     Column,
     DistanceStrategy,
-    HNSWIndex,
     HybridSearchConfig,
+    IVFIndex,
+    IVFQueryOptions,
     JsonFieldIndex,
     MetadataColumnIndex,
     MetadataIndexConfig,
@@ -36,16 +37,38 @@ CONNINFO = os.environ.get(
 DIM = 8
 
 
-def _db_available() -> bool:
+def _ivf_available() -> bool:
+    """Whether the target SereneDB is reachable AND supports the IVF vector index.
+
+    The suite targets the IVF-capable engine; on a build without IVF (e.g. an older
+    ``serenedb:latest`` image) the whole module is skipped rather than failing.
+    """
     try:
-        with psycopg.connect(CONNINFO, connect_timeout=3):
-            return True
+        with (
+            psycopg.connect(CONNINFO, connect_timeout=3, autocommit=True) as conn,
+            conn.cursor() as cur,
+        ):
+            cur.execute("DROP TABLE IF EXISTS _lc_ivf_probe")
+            cur.execute(
+                "CREATE TABLE _lc_ivf_probe (id TEXT PRIMARY KEY, emb FLOAT[4])"
+            )
+            try:
+                cur.execute(
+                    "CREATE INDEX _lc_ivf_probe_idx ON _lc_ivf_probe "
+                    "USING inverted (emb ivf (metric = 'l2'))"
+                )
+                return True
+            except Exception:
+                return False
+            finally:
+                cur.execute("DROP TABLE IF EXISTS _lc_ivf_probe")
     except Exception:
         return False
 
 
 pytestmark = pytest.mark.skipif(
-    not _db_available(), reason=f"SereneDB not reachable at {CONNINFO!r}"
+    not _ivf_available(),
+    reason=f"SereneDB with IVF vector index not reachable at {CONNINFO!r}",
 )
 
 
@@ -279,10 +302,64 @@ def test_get_by_ids(store):
 
 def test_apply_index_and_search(store):
     vs, _ = store
-    vs.apply_vector_index(HNSWIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE))
+    vs.apply_vector_index(IVFIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE))
     assert vs.is_valid_index() is True
     res = vs.similarity_search("quantum physics", k=1)
     assert res[0].page_content == "quantum physics"
+
+
+def test_ivf_index_options_string():
+    """IVFIndex emits only the options that are set (unset ones defer to DB auto)."""
+    assert IVFIndex().index_options() == "ivf (metric = 'cosine')"
+    assert (
+        IVFIndex(
+            distance_strategy=DistanceStrategy.EUCLIDEAN, quant="sq8", nlist=100
+        ).index_options()
+        == "ivf (metric = 'l2', quant = 'sq8', nlist = 100)"
+    )
+
+
+def test_ivf_quantized_index_and_search():
+    """A quantized IVF index (sq8, l2) builds and serves an exact-match query."""
+    table = f"lc_ivfq_{uuid.uuid4().hex[:8]}"
+    engine = SereneDBEngine.from_connection_string(CONNINFO)
+    engine.init_vectorstore_table(table, DIM, overwrite_existing=True)
+    vs = SereneDBVectorStore.create_sync(
+        engine, DetEmb(), table, distance_strategy=DistanceStrategy.EUCLIDEAN
+    )
+    try:
+        vs.add_texts(
+            ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"]
+        )
+        # quant='sq8' requires metric l2/ip; nlist=1 keeps training trivial for the tiny set.
+        vs.apply_vector_index(
+            IVFIndex(distance_strategy=DistanceStrategy.EUCLIDEAN, quant="sq8", nlist=1)
+        )
+        assert vs.is_valid_index() is True
+        res = vs.similarity_search("gamma", k=1)
+        assert res[0].page_content == "gamma"
+    finally:
+        engine.drop_table(table)
+        engine.close()
+
+
+def test_ivf_query_options_nprobe():
+    """IVFQueryOptions(nprobe=…) flows through as a SET LOCAL prelude and search works."""
+    table = f"lc_ivfnp_{uuid.uuid4().hex[:8]}"
+    engine = SereneDBEngine.from_connection_string(CONNINFO)
+    engine.init_vectorstore_table(
+        table, DIM, overwrite_existing=True, vector_index=IVFIndex()
+    )
+    vs = SereneDBVectorStore.create_sync(
+        engine, DetEmb(), table, index_query_options=IVFQueryOptions(nprobe=10)
+    )
+    try:
+        vs.add_texts(["red", "green", "blue"])
+        res = vs.similarity_search("green", k=1)
+        assert res[0].page_content == "green"
+    finally:
+        engine.drop_table(table)
+        engine.close()
 
 
 def test_delete(store):
@@ -352,7 +429,7 @@ def test_init_creates_vector_index():
         table,
         DIM,
         overwrite_existing=True,
-        vector_index=HNSWIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE),
+        vector_index=IVFIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE),
     )
     vs = SereneDBVectorStore.create_sync(
         engine, DetEmb(), table, distance_strategy=DistanceStrategy.COSINE_DISTANCE
@@ -413,7 +490,7 @@ def test_rrf_fusion():
 
 
 def test_vector_search_in_non_public_schema():
-    """Dense search must route through the schema-qualified HNSW index."""
+    """Dense search must route through the schema-qualified vector index."""
     schema = f"lc_sch_{uuid.uuid4().hex[:8]}"
     table = "vitems"
     engine = SereneDBEngine.from_connection_string(CONNINFO)
@@ -424,13 +501,13 @@ def test_vector_search_in_non_public_schema():
         overwrite_existing=True,
         schema_name=schema,
         metadata_columns=[Column("category", "TEXT")],
-        vector_index=HNSWIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE),
+        vector_index=IVFIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE),
     )
     vs = SereneDBVectorStore.create_sync(
         engine, DetEmb(), table, schema_name=schema, metadata_columns=["category"]
     )
     try:
-        # The HNSW index lives in the custom schema and must resolve there.
+        # The vector index lives in the custom schema and must resolve there.
         assert vs.is_valid_index() is True
         vs.add_texts(
             ["the quick brown fox", "a lazy dog", "quantum physics"],
@@ -504,14 +581,14 @@ def test_init_if_not_exists_is_idempotent():
     table = f"lc_ine_{uuid.uuid4().hex[:8]}"
     engine = SereneDBEngine.from_connection_string(CONNINFO)
     engine.init_vectorstore_table(
-        table, DIM, if_not_exists=True, vector_index=HNSWIndex()
+        table, DIM, if_not_exists=True, vector_index=IVFIndex()
     )
     vs = SereneDBVectorStore.create_sync(engine, DetEmb(), table)
     try:
         vs.add_texts(["alpha", "beta"])
         # Re-init: must not error, must not wipe the rows, must keep the index.
         engine.init_vectorstore_table(
-            table, DIM, if_not_exists=True, vector_index=HNSWIndex()
+            table, DIM, if_not_exists=True, vector_index=IVFIndex()
         )
         assert vs.is_valid_index() is True
         res = vs.similarity_search("alpha", k=1)
@@ -802,7 +879,7 @@ def test_sync_load_false_then_manual_refresh():
     table = f"lc_syncload_{uuid.uuid4().hex[:8]}"
     engine = SereneDBEngine.from_connection_string(CONNINFO)
     engine.init_vectorstore_table(
-        table, DIM, overwrite_existing=True, vector_index=HNSWIndex()
+        table, DIM, overwrite_existing=True, vector_index=IVFIndex()
     )
     vs = SereneDBVectorStore.create_sync(engine, DetEmb(), table, sync_load=False)
     try:
@@ -849,7 +926,7 @@ def _make_indexed_store(metadata_index):
         metadata_index=metadata_index,
     )
     vs.add_texts(_MI_TEXTS, metadatas=_MI_METAS)
-    vs.apply_vector_index(HNSWIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE))
+    vs.apply_vector_index(IVFIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE))
     return vs, engine, table
 
 
@@ -870,11 +947,13 @@ def _explain_where(table, where_sql):
 def _has_standalone_filter(plan_text):
     """Whether the plan has a standalone FILTER node (predicate NOT pushed into the scan).
 
-    SereneDB renders the plan as boxes; a post-filter shows a box whose sole title line
-    is ``FILTER``. A pushed-down predicate instead appears as a ``TextFilter`` /
-    ``Term`` / ``GranularRange`` block *inside* the ``IRESEARCH_SCAN`` box.
+    SereneDB renders each plan node as a box whose title sits in the top border
+    (``╭─ FILTER ──┴──╮``); stripping the box-drawing characters off a line yields the
+    node title. A pushed-down predicate instead appears as a ``Filter:`` label +
+    ``Term`` / ``GranularRange`` / ``Vector KNN`` block *inside* the ``IRESEARCH_SCAN``
+    node (never its own ``FILTER`` box).
     """
-    return any(line.strip().strip("│ ") == "FILTER" for line in plan_text.splitlines())
+    return any(line.strip("╭╮╰╯├┤┬┴─│ ") == "FILTER" for line in plan_text.splitlines())
 
 
 # The declared-JSON query expressions must match how the index was built (arrow + cast).
@@ -1022,7 +1101,7 @@ def test_default_index_skips_unindexable_column_at_table_creation():
         DIM,
         overwrite_existing=True,
         metadata_columns=[Column("category", "TEXT"), Column("price", "DECIMAL(10,2)")],
-        vector_index=HNSWIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE),
+        vector_index=IVFIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE),
     )  # must NOT raise despite the DECIMAL column
     vs = SereneDBVectorStore.create_sync(
         engine,
@@ -1082,7 +1161,7 @@ def test_default_index_skips_unindexable_column_at_apply():
         vs.add_texts(["a", "b"], metadatas=[{"category": "x"}, {"category": "y"}])
         # Default (metadata_index=None): must not raise; skips the DECIMAL column.
         vs.apply_vector_index(
-            HNSWIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE)
+            IVFIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE)
         )
         assert vs.is_valid_index() is True
         assert not _has_standalone_filter(_explain_where(table, "\"category\" = 'x'"))
@@ -1112,7 +1191,7 @@ def test_explicit_unindexable_column_surfaces_db_error():
     try:
         with pytest.raises(Exception):
             vs.apply_vector_index(
-                HNSWIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE)
+                IVFIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE)
             )
     finally:
         engine.drop_table(table)
@@ -1131,7 +1210,7 @@ def test_distance_named_metadata_column_dense():
         DIM,
         overwrite_existing=True,
         metadata_columns=[Column("distance", "TEXT")],
-        vector_index=HNSWIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE),
+        vector_index=IVFIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE),
     )
     vs = SereneDBVectorStore.create_sync(
         engine,

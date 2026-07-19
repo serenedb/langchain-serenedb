@@ -1,12 +1,13 @@
 """Index classes for adding vector indexes on the SereneDBVectorStore.
 
 SereneDB provides approximate-nearest-neighbor search through an **inverted index**
-with an ``hnsw`` operator class on a fixed-size ``FLOAT[N]`` column::
+with an ``ivf`` operator class on a fixed-size ``FLOAT[N]`` column::
 
-    CREATE INDEX idx ON tbl USING inverted (embedding hnsw (metric = 'cosine', m = 16, ef_construction = 64))
+    CREATE INDEX idx ON tbl USING inverted (embedding ivf (metric = 'cosine', nlist = 100))
 
-HNSW is the only ANN index type. The distance *metric* is required and must match the
-operator used at query time for the index to accelerate the search. See
+IVF is the ANN index type. The distance *metric* is required and must match the operator
+used at query time for the index to accelerate the search; optional quantization
+(``quant``) trades recall for memory/speed. See
 https://<serenedb-docs>/sql/indexes/inverted/vector-search.
 """
 
@@ -27,7 +28,7 @@ class StrategyMixin:
         operator: The infix distance operator used in ``ORDER BY`` (e.g. ``<=>``).
         search_function: The named scalar distance function used to compute the
             score column (e.g. ``cosine_distance``).
-        index_metric: The ``metric`` value the HNSW index must be built with for the
+        index_metric: The ``metric`` value the IVF index must be built with for the
             operator to accelerate (one of ``l2``, ``cosine``, ``ip``, ``l1``).
     """
 
@@ -39,7 +40,7 @@ class StrategyMixin:
 class DistanceStrategy(StrategyMixin, enum.Enum):
     """Enumerator of the distance strategies supported by SereneDB.
 
-    Each strategy bundles the query operator, the named distance function and the HNSW
+    Each strategy bundles the query operator, the named distance function and the IVF
     index ``metric`` for one distance measure: Euclidean (L2), cosine, inner product,
     and Manhattan (L1).
     """
@@ -132,42 +133,77 @@ class QueryOptions(ABC):
 
 
 @dataclass
-class HNSWIndex(BaseIndex):
-    """HNSW inverted-index configuration.
+class IVFIndex(BaseIndex):
+    """IVF inverted-index configuration.
 
-    ``m`` and ``ef_construction`` tune the graph; the ``metric`` is derived from
-    :attr:`distance_strategy`. Recommended ranges: ``m`` 2-128, ``ef_construction``
-    10-500.
+    The ``metric`` is derived from :attr:`distance_strategy`. Every other option is
+    optional and, when left ``None``, is omitted from the DDL so SereneDB chooses its
+    default (e.g. ``nlist`` auto-scales with the row count).
+
+    Attributes:
+        nlist: Number of IVF cluster lists (``>= 1``). Mutually exclusive with
+            ``nlist_factor``.
+        nlist_factor: Scales the auto-chosen list count
+            (``nlist = round(nlist_factor * sqrt(rows))``). Mutually exclusive with
+            ``nlist``.
+        quant: Vector quantization — one of ``"sq8"``, ``"sq4"``, ``"pq"``,
+            ``"rabitq"``, ``"none"``. Quantized modes require metric ``l2`` or ``ip``.
+        pq_m: Number of PQ sub-quantizers (must divide the vector dimension); valid only
+            with ``quant="pq"``.
+        rabitq_bits: RaBitQ bit count (1-9); valid only with ``quant="rabitq"``.
+
+    Option combinations are validated by the database at CREATE INDEX time, not here.
     """
 
-    index_type: str = "hnsw"
-    m: int = 16
-    ef_construction: int = 64
+    index_type: str = "ivf"
+    nlist: Optional[int] = None
+    nlist_factor: Optional[float] = None
+    quant: Optional[str] = None
+    pq_m: Optional[int] = None
+    rabitq_bits: Optional[int] = None
 
     def index_options(self) -> str:
-        """Return the ``hnsw`` operator-class spec for the embedding column.
+        """Return the ``ivf`` operator-class spec for the embedding column.
 
-        Example: ``hnsw (metric = 'cosine', m = 16, ef_construction = 64)``.
+        Only the options that are set are emitted, e.g. ``ivf (metric = 'cosine')`` or
+        ``ivf (metric = 'l2', quant = 'sq8', nlist = 100)``.
         """
-        return (
-            f"hnsw (metric = '{self.get_index_metric()}', "
-            f"m = {self.m}, ef_construction = {self.ef_construction})"
-        )
+        opts = [f"metric = '{self.get_index_metric()}'"]
+        if self.quant is not None:
+            opts.append(f"quant = '{self.quant}'")
+        if self.pq_m is not None:
+            opts.append(f"pq_m = {self.pq_m}")
+        if self.rabitq_bits is not None:
+            opts.append(f"rabitq_bits = {self.rabitq_bits}")
+        if self.nlist is not None:
+            opts.append(f"nlist = {self.nlist}")
+        if self.nlist_factor is not None:
+            opts.append(f"nlist_factor = {self.nlist_factor}")
+        return f"ivf ({', '.join(opts)})"
 
 
 @dataclass
-class HNSWQueryOptions(QueryOptions):
-    """Per-session HNSW search tuning.
+class IVFQueryOptions(QueryOptions):
+    """Per-session IVF search tuning.
 
-    ``ef_search`` is applied as the ``sdb_ef_search`` session setting; ``0`` uses the
-    query's ``LIMIT`` as the search beam.
+    ``nprobe`` is the number of IVF cluster lists scanned per query (higher = better
+    recall, slower), applied as the ``sdb_nprobe`` session setting. ``rerank_factor``
+    sizes the exact-distance rerank pool for a *quantized* index (``pool =
+    rerank_factor * k``; ``0`` disables reranking), applied as ``sdb_rerank_factor``.
+    A field left ``None`` is omitted so SereneDB's own default applies.
     """
 
-    ef_search: int = 0
+    nprobe: Optional[int] = None
+    rerank_factor: Optional[int] = None
 
     def to_parameter(self) -> list[str]:
-        """Convert index attributes to list of configurations."""
-        return [f"sdb_ef_search = {self.ef_search}"]
+        """Return ``SET LOCAL`` bodies for the options that were set (empty if none)."""
+        params: list[str] = []
+        if self.nprobe is not None:
+            params.append(f"sdb_nprobe = {self.nprobe}")
+        if self.rerank_factor is not None:
+            params.append(f"sdb_rerank_factor = {self.rerank_factor}")
+        return params
 
     def to_string(self) -> str:
         """Convert index attributes to string."""
@@ -175,7 +211,7 @@ class HNSWQueryOptions(QueryOptions):
             "to_string is deprecated, use to_parameter instead.",
             DeprecationWarning,
         )
-        return f"sdb_ef_search = {self.ef_search}"
+        return "; ".join(self.to_parameter())
 
 
 @dataclass
@@ -366,19 +402,19 @@ def build_vector_index_ddl(
     table_name: str,
     embedding_column: str,
     index_name: str,
-    hnsw_options: str,
+    vector_opclass: str,
     metadata_entries: Optional[list[str]] = None,
     if_not_exists: bool = False,
 ) -> str:
-    """CREATE INDEX for a vector HNSW inverted index on the embedding column.
+    """CREATE INDEX for a vector inverted index on the embedding column.
 
-    ``hnsw_options`` is the operator-class spec produced by :meth:`HNSWIndex.index_options`,
-    e.g. ``hnsw (metric = 'cosine', m = 16, ef_construction = 64)``. ``metadata_entries``
-    (from :func:`build_metadata_index_entries`) are appended so metadata filters can be
-    served by the index scan.
+    ``vector_opclass`` is the operator-class spec produced by :meth:`IVFIndex.index_options`,
+    e.g. ``ivf (metric = 'cosine', nlist = 100)``. ``metadata_entries`` (from
+    :func:`build_metadata_index_entries`) are appended so metadata filters can be served
+    by the index scan.
     """
     ine = "IF NOT EXISTS " if if_not_exists else ""
-    columns = f"{_quote_ident(embedding_column)} {hnsw_options}"
+    columns = f"{_quote_ident(embedding_column)} {vector_opclass}"
     if metadata_entries:
         columns += ", " + ", ".join(metadata_entries)
     return (
@@ -397,20 +433,20 @@ def build_hybrid_index_ddl(
     id_column: str,
     index_name: str,
     dictionary_name: str,
-    hnsw_options: str,
+    vector_opclass: str,
     metadata_entries: Optional[list[str]] = None,
     if_not_exists: bool = True,
 ) -> str:
     """CREATE INDEX for one combined inverted index covering the content column
-    (analyzed for BM25 full-text) and the embedding column (HNSW), storing the id via
-    ``INCLUDE`` so the lexical branch can return it. ``metadata_entries`` (from
+    (analyzed for BM25 full-text) and the embedding column (vector ANN), storing the id
+    via ``INCLUDE`` so the lexical branch can return it. ``metadata_entries`` (from
     :func:`build_metadata_index_entries`) are appended so metadata filters can be served
     by the index scan.
     """
     ine = "IF NOT EXISTS " if if_not_exists else ""
     columns = (
         f"{_quote_ident(content_column)} {_quote_ident(dictionary_name)}, "
-        f"{_quote_ident(embedding_column)} {hnsw_options}"
+        f"{_quote_ident(embedding_column)} {vector_opclass}"
     )
     if metadata_entries:
         columns += ", " + ", ".join(metadata_entries)

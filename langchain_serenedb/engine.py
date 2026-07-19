@@ -20,7 +20,7 @@ from .indexes import (
     DEFAULT_INDEX_NAME_SUFFIX,
     BaseIndex,
     ExactNearestNeighbor,
-    HNSWIndex,
+    IVFIndex,
     MetadataIndexConfig,
     build_dictionary_ddl,
     build_hybrid_index_ddl,
@@ -357,9 +357,9 @@ class SereneDBEngine:
                     vector_index is not None
                     and not isinstance(vector_index, ExactNearestNeighbor)
                 )
-                else HNSWIndex()
+                else IVFIndex()
             )
-            hnsw_options = index.index_options()
+            vector_opclass = index.index_options()
             metadata_entries = build_metadata_index_entries(
                 metadata_index,
                 metadata_json_column=metadata_json_column if store_metadata else None,
@@ -382,7 +382,7 @@ class SereneDBEngine:
                         id_column=raw_id_column_name,
                         index_name=raw_table_name + DEFAULT_INDEX_NAME_SUFFIX,
                         dictionary_name=hybrid_search_config.dictionary_name,
-                        hnsw_options=hnsw_options,
+                        vector_opclass=vector_opclass,
                         metadata_entries=metadata_entries,
                         if_not_exists=if_not_exists,
                     )
@@ -394,7 +394,7 @@ class SereneDBEngine:
                         table_name=raw_table_name,
                         embedding_column=raw_embedding_column,
                         index_name=raw_table_name + DEFAULT_INDEX_NAME_SUFFIX,
-                        hnsw_options=hnsw_options,
+                        vector_opclass=vector_opclass,
                         metadata_entries=metadata_entries,
                         if_not_exists=if_not_exists,
                     )
@@ -420,7 +420,7 @@ class SereneDBEngine:
     ) -> None:
         """Async: create a table for storing vectors.
 
-        Pass ``vector_index`` (e.g. ``HNSWIndex(distance_strategy=...)``) to also build
+        Pass ``vector_index`` (e.g. ``IVFIndex(distance_strategy=...)``) to also build
         the ANN index on the embedding column, or ``hybrid_search_config`` to build the
         combined full-text + vector index — both in the same call as table creation.
         ``if_not_exists=True`` makes the call idempotent (create only when absent; keeps
@@ -468,7 +468,7 @@ class SereneDBEngine:
     ) -> None:
         """Sync: create a table for storing vectors.
 
-        Pass ``vector_index`` (e.g. ``HNSWIndex(distance_strategy=...)``) to also build
+        Pass ``vector_index`` (e.g. ``IVFIndex(distance_strategy=...)``) to also build
         the ANN index on the embedding column, or ``hybrid_search_config`` to build the
         combined full-text + vector index — both in the same call as table creation.
         ``if_not_exists=True`` makes the call idempotent (create only when absent; keeps
@@ -523,7 +523,8 @@ class SereneDBEngine:
         """Publish buffered writes to the inverted index so new rows are searchable.
 
         SereneDB's inverted index is eventually consistent: rows written since the last
-        refresh are invisible to full-text and HNSW-routed queries until refreshed. Call
+        refresh are invisible to full-text and vector-index-routed queries until
+        refreshed. Call
         this after ``add_texts``/``delete`` when the table has an inverted index.
         """
         schema_name = self._escape_identifier(schema_name)

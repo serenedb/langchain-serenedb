@@ -10,7 +10,7 @@ It maps the integration onto SereneDB's native capabilities:
 |---|---|
 | Vector column |  `FLOAT[N]`  |
 | Distance ops | `<->`, `<=>`, `<#>`, `<+>` |
-| ANN index |  inverted index on the vector column e.g. `USING inverted (emb hnsw (metric='cosine', ...))` |
+| ANN index |  inverted index on the vector column e.g. `USING inverted (emb ivf (metric='cosine', ...))` |
 | Full-text |  inverted index on the text column + `BM25(idx.tableoid)` |
 | Metadata | `JSON` column, explicit columns |
 
@@ -26,7 +26,7 @@ a checkout (`pip install -e .`; see [CONTRIBUTING.md](CONTRIBUTING.md)).
 ## Quickstart (engine + table)
 
 ```python
-from langchain_serenedb import SereneDBEngine, HNSWIndex
+from langchain_serenedb import SereneDBEngine, IVFIndex
 
 engine = SereneDBEngine.from_connection_string(
     "host=127.0.0.1 port=7890 user=postgres dbname=postgres"
@@ -35,9 +35,9 @@ engine = SereneDBEngine.from_connection_string(
 # Table only (vector search falls back to an exact scan until an index is built):
 engine.init_vectorstore_table(table_name="my_docs", vector_size=768)
 
-# Or create the table and its HNSW ANN index in one call, so vector search is
+# Or create the table and its IVF ANN index in one call, so vector search is
 # accelerated from the start:
-engine.init_vectorstore_table("my_docs", 768, vector_index=HNSWIndex())
+engine.init_vectorstore_table("my_docs", 768, vector_index=IVFIndex())
 #   ...or the combined full-text + vector index for hybrid search:
 #   engine.init_vectorstore_table("my_docs", 768, hybrid_search_config=HybridSearchConfig())
 
@@ -45,8 +45,8 @@ engine.init_vectorstore_table("my_docs", 768, vector_index=HNSWIndex())
 engine.refresh_table("my_docs")
 ```
 
-> **Tip:** for a large bulk load, SereneDB builds a more compact graph if you create the
-> index *after* loading (`store.apply_vector_index(HNSWIndex())`); creating it up front
+> **Tip:** for a large bulk load, SereneDB trains better IVF clusters if you create the
+> index *after* loading (`store.apply_vector_index(IVFIndex())`); creating it up front
 > with the table is the convenient choice for incremental workloads.
 
 ## Contributing

@@ -13,7 +13,7 @@ SereneDB specifics honored here:
 - Eventual consistency: after writes, ``VACUUM (REFRESH_TABLE)`` publishes rows to the
   inverted index; ``aadd_embeddings`` / ``adelete`` refresh automatically unless the
   store was created with ``sync_load=False`` (then the caller owns refreshing).
-- Vector index: ``CREATE INDEX ... USING inverted (emb hnsw (metric='cosine', ...))``.
+- Vector index: ``CREATE INDEX ... USING inverted (emb ivf (metric='cosine', ...))``.
 """
 
 from __future__ import annotations
@@ -161,7 +161,7 @@ class AsyncSereneDBVectorStore(VectorStore):
         return self.embedding_service
 
     async def _avector_index_available(self) -> bool:
-        """Whether this collection's HNSW index exists (cached).
+        """Whether this collection's vector (IVF) index exists (cached).
 
         The dense query only uses the index when selecting from it by name, so it needs
         to know whether the index is there. Determined once via ``is_valid_index`` and
@@ -240,8 +240,8 @@ class AsyncSereneDBVectorStore(VectorStore):
 
         ``sync_load=False`` skips the automatic inverted-index refresh after each
         write (add/delete), so a bulk load runs faster; the caller then owns calling
-        ``refresh_table()`` before those rows are visible to full-text / HNSW-routed
-        queries.
+        ``refresh_table()`` before those rows are visible to full-text / vector-index-
+        routed queries.
 
         Validates the requested columns against ``information_schema.columns``. Note
         that SereneDB reports a ``FLOAT[N]`` embedding column with ``data_type =
@@ -557,7 +557,7 @@ class AsyncSereneDBVectorStore(VectorStore):
             safe_filter, filter_dict = self._create_filter_clause(filter)
         where_filters = f"WHERE {safe_filter}" if safe_filter else ""
 
-        # SereneDB routes an ``ORDER BY emb <op> q LIMIT k`` through the HNSW index only
+        # SereneDB routes an ``ORDER BY emb <op> q LIMIT k`` through the vector index only
         # when selecting *from the index by name*; querying the base table scans exactly.
         # So read from the index when it exists, and fall back to an exact scan of the
         # table otherwise.
@@ -814,7 +814,7 @@ class AsyncSereneDBVectorStore(VectorStore):
         *,
         concurrently: bool = False,
     ) -> None:
-        """Create the collection's single HNSW inverted index on the embedding column.
+        """Create the collection's single vector (IVF) inverted index on the embedding column.
 
         The index name is derived from the table (:attr:`_vector_index_name`) — one
         index per collection, fully controlled by the store. When a
@@ -829,7 +829,7 @@ class AsyncSereneDBVectorStore(VectorStore):
         if index.distance_strategy != self.distance_strategy:
             # Keep the index metric aligned with the store's query operator.
             index.distance_strategy = self.distance_strategy
-        hnsw_options = index.index_options()
+        vector_opclass = index.index_options()
         index_name = self._vector_index_name
         metadata_entries = build_metadata_index_entries(
             self.metadata_index,
@@ -847,7 +847,7 @@ class AsyncSereneDBVectorStore(VectorStore):
                 id_column=self.id_column,
                 index_name=index_name,
                 dictionary_name=self.hybrid_search_config.dictionary_name,
-                hnsw_options=hnsw_options,
+                vector_opclass=vector_opclass,
                 metadata_entries=metadata_entries,
             )
         else:
@@ -856,23 +856,30 @@ class AsyncSereneDBVectorStore(VectorStore):
                 table_name=self.table_name,
                 embedding_column=self.embedding_column,
                 index_name=index_name,
-                hnsw_options=hnsw_options,
+                vector_opclass=vector_opclass,
                 metadata_entries=metadata_entries,
             )
         await self.engine._aexecute(stmt)
         self._index_exists = True
 
-    async def aapply_hybrid_search_index(self, concurrently: bool = False) -> None:
-        """Create the combined inverted index for hybrid search."""
+    async def aapply_hybrid_search_index(
+        self, index: Optional[BaseIndex] = None, concurrently: bool = False
+    ) -> None:
+        """Create the combined inverted index for hybrid search.
+
+        ``index`` selects the vector-index configuration (defaults to a plain
+        :class:`~langchain_serenedb.indexes.IVFIndex`); pass e.g.
+        ``IVFIndex(quant="sq8", ...)`` to build a quantized combined index.
+        """
         if not self.hybrid_search_config:
             raise ValueError(
                 "hybrid_search_config is required to create a hybrid search index."
             )
-        from .indexes import HNSWIndex
+        if index is None:
+            from .indexes import IVFIndex
 
-        await self.aapply_vector_index(
-            HNSWIndex(distance_strategy=self.distance_strategy)
-        )
+            index = IVFIndex(distance_strategy=self.distance_strategy)
+        await self.aapply_vector_index(index, concurrently=concurrently)
 
     async def areindex(self) -> None:
         """Recompute inverted-index statistics (SereneDB has no ``REINDEX``)."""

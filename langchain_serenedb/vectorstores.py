@@ -71,7 +71,7 @@ class SereneDBVectorStore(VectorStore):
 
         ``sync_load=False`` skips the automatic inverted-index refresh after each write
         so bulk loads run faster; the caller must then call ``refresh_table()`` to make
-        the rows visible to full-text / HNSW-routed queries.
+        the rows visible to full-text / vector-index-routed queries.
         """
         coro = AsyncSereneDBVectorStore.create(
             engine,
@@ -212,9 +212,11 @@ class SereneDBVectorStore(VectorStore):
             self.__vs.aapply_vector_index(index, concurrently=concurrently)
         )
 
-    def apply_hybrid_search_index(self, *, concurrently: bool = False) -> None:
+    def apply_hybrid_search_index(
+        self, index: Optional[BaseIndex] = None, *, concurrently: bool = False
+    ) -> None:
         return self._engine._run_as_sync(
-            self.__vs.aapply_hybrid_search_index(concurrently=concurrently)
+            self.__vs.aapply_hybrid_search_index(index, concurrently=concurrently)
         )
 
     def reindex(self) -> None:
