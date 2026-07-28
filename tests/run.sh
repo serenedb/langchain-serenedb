@@ -31,6 +31,11 @@
 #   SERENEDB_PORT      Port, equivalent to --port.
 #   SERENEDB_USER      User used when building a conninfo. Default postgres.
 #   SERENEDB_DBNAME    Database used when building a conninfo. Default postgres.
+#   SERENEDB_PASSWORD  Password used when building a conninfo. Default: none (unset).
+#                      The containerized image requires password auth over the network
+#                      (loopback still trusts a passwordless superuser), so set this to
+#                      the superuser password there. Ignored when --conninfo/
+#                      SERENEDB_CONNINFO is given (pass the password in that string).
 #   SERENEDB_WAIT_TIMEOUT  Readiness timeout in seconds, equivalent to --timeout.
 #   PYTHON             Interpreter used for pytest and readiness checks. Defaults to
 #                      the repo's .venv/bin/python if present, else python3. It must
@@ -94,6 +99,9 @@ if [[ -z "$CONNINFO" ]]; then
     exit 2
   fi
   CONNINFO="host=$HOST port=$PORT user=${SERENEDB_USER:-postgres} dbname=${SERENEDB_DBNAME:-postgres}"
+  if [[ -n "${SERENEDB_PASSWORD:-}" ]]; then
+    CONNINFO="$CONNINFO password=${SERENEDB_PASSWORD}"
+  fi
 fi
 
 TIMEOUT="${TIMEOUT:-${SERENEDB_WAIT_TIMEOUT:-30}}"
@@ -114,7 +122,9 @@ except Exception:
 PYEOF
 }
 
-echo ">> target   : $CONNINFO"
+# Redact any password before logging so it does not leak into CI output.
+CONNINFO_REDACTED="$(printf '%s' "$CONNINFO" | sed -E 's/password=[^ ]*/password=***/')"
+echo ">> target   : $CONNINFO_REDACTED"
 echo ">> python   : $PYTHON"
 
 # Wait until the instance accepts connections. Instance-agnostic: we only poll the

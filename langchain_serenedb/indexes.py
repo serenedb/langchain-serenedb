@@ -3,7 +3,7 @@
 SereneDB provides approximate-nearest-neighbor search through an **inverted index**
 with an ``ivf`` operator class on a fixed-size ``FLOAT[N]`` column::
 
-    CREATE INDEX idx ON tbl USING inverted (embedding ivf (metric = 'cosine', nlist = 100))
+    CREATE INDEX idx ON tbl USING inverted (embedding ivf (metric = 'cosine', quant = 'sq8'))
 
 IVF is the ANN index type. The distance *metric* is required and must match the operator
 used at query time for the index to accelerate the search; optional quantization
@@ -138,35 +138,31 @@ class IVFIndex(BaseIndex):
 
     The ``metric`` is derived from :attr:`distance_strategy`. Every other option is
     optional and, when left ``None``, is omitted from the DDL so SereneDB chooses its
-    default (e.g. ``nlist`` auto-scales with the row count).
+    default (the number of cluster lists is auto-scaled with the row count).
 
     Attributes:
-        nlist: Number of IVF cluster lists (``>= 1``). Mutually exclusive with
-            ``nlist_factor``.
-        nlist_factor: Scales the auto-chosen list count
-            (``nlist = round(nlist_factor * sqrt(rows))``). Mutually exclusive with
-            ``nlist``.
         quant: Vector quantization — one of ``"sq8"``, ``"sq4"``, ``"pq"``,
             ``"rabitq"``, ``"none"``. Quantized modes require metric ``l2`` or ``ip``.
         pq_m: Number of PQ sub-quantizers (must divide the vector dimension); valid only
             with ``quant="pq"``.
         rabitq_bits: RaBitQ bit count (1-9); valid only with ``quant="rabitq"``.
+        compression: When ``False``, store the index vectors uncompressed (default is
+            ``True`` in the database).
 
     Option combinations are validated by the database at CREATE INDEX time, not here.
     """
 
     index_type: str = "ivf"
-    nlist: Optional[int] = None
-    nlist_factor: Optional[float] = None
     quant: Optional[str] = None
     pq_m: Optional[int] = None
     rabitq_bits: Optional[int] = None
+    compression: Optional[bool] = None
 
     def index_options(self) -> str:
         """Return the ``ivf`` operator-class spec for the embedding column.
 
         Only the options that are set are emitted, e.g. ``ivf (metric = 'cosine')`` or
-        ``ivf (metric = 'l2', quant = 'sq8', nlist = 100)``.
+        ``ivf (metric = 'l2', quant = 'sq8', compression = false)``.
         """
         opts = [f"metric = '{self.get_index_metric()}'"]
         if self.quant is not None:
@@ -175,10 +171,8 @@ class IVFIndex(BaseIndex):
             opts.append(f"pq_m = {self.pq_m}")
         if self.rabitq_bits is not None:
             opts.append(f"rabitq_bits = {self.rabitq_bits}")
-        if self.nlist is not None:
-            opts.append(f"nlist = {self.nlist}")
-        if self.nlist_factor is not None:
-            opts.append(f"nlist_factor = {self.nlist_factor}")
+        if self.compression is not None:
+            opts.append(f"compression = {str(self.compression).lower()}")
         return f"ivf ({', '.join(opts)})"
 
 
@@ -409,7 +403,7 @@ def build_vector_index_ddl(
     """CREATE INDEX for a vector inverted index on the embedding column.
 
     ``vector_opclass`` is the operator-class spec produced by :meth:`IVFIndex.index_options`,
-    e.g. ``ivf (metric = 'cosine', nlist = 100)``. ``metadata_entries`` (from
+    e.g. ``ivf (metric = 'cosine', quant = 'sq8')``. ``metadata_entries`` (from
     :func:`build_metadata_index_entries`) are appended so metadata filters can be served
     by the index scan.
     """

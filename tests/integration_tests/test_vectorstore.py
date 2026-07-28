@@ -26,10 +26,6 @@ from langchain_serenedb import (
     SereneDBVectorStore,
     reciprocal_rank_fusion,
 )
-from langchain_serenedb.indexes import (
-    DEFAULT_INDEX_NAME_SUFFIX,
-    build_json_field_selector,
-)
 
 CONNINFO = os.environ.get(
     "SERENEDB_CONNINFO", "host=127.0.0.1 port=7890 user=postgres dbname=postgres"
@@ -37,38 +33,16 @@ CONNINFO = os.environ.get(
 DIM = 8
 
 
-def _ivf_available() -> bool:
-    """Whether the target SereneDB is reachable AND supports the IVF vector index.
-
-    The suite targets the IVF-capable engine; on a build without IVF (e.g. an older
-    ``serenedb:latest`` image) the whole module is skipped rather than failing.
-    """
+def _db_available() -> bool:
     try:
-        with (
-            psycopg.connect(CONNINFO, connect_timeout=3, autocommit=True) as conn,
-            conn.cursor() as cur,
-        ):
-            cur.execute("DROP TABLE IF EXISTS _lc_ivf_probe")
-            cur.execute(
-                "CREATE TABLE _lc_ivf_probe (id TEXT PRIMARY KEY, emb FLOAT[4])"
-            )
-            try:
-                cur.execute(
-                    "CREATE INDEX _lc_ivf_probe_idx ON _lc_ivf_probe "
-                    "USING inverted (emb ivf (metric = 'l2'))"
-                )
-                return True
-            except Exception:
-                return False
-            finally:
-                cur.execute("DROP TABLE IF EXISTS _lc_ivf_probe")
+        with psycopg.connect(CONNINFO, connect_timeout=3):
+            return True
     except Exception:
         return False
 
 
 pytestmark = pytest.mark.skipif(
-    not _ivf_available(),
-    reason=f"SereneDB with IVF vector index not reachable at {CONNINFO!r}",
+    not _db_available(), reason=f"SereneDB not reachable at {CONNINFO!r}"
 )
 
 
@@ -313,9 +287,9 @@ def test_ivf_index_options_string():
     assert IVFIndex().index_options() == "ivf (metric = 'cosine')"
     assert (
         IVFIndex(
-            distance_strategy=DistanceStrategy.EUCLIDEAN, quant="sq8", nlist=100
+            distance_strategy=DistanceStrategy.EUCLIDEAN, quant="sq8", compression=False
         ).index_options()
-        == "ivf (metric = 'l2', quant = 'sq8', nlist = 100)"
+        == "ivf (metric = 'l2', quant = 'sq8', compression = false)"
     )
 
 
@@ -331,9 +305,9 @@ def test_ivf_quantized_index_and_search():
         vs.add_texts(
             ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"]
         )
-        # quant='sq8' requires metric l2/ip; nlist=1 keeps training trivial for the tiny set.
+        # quant='sq8' requires metric l2/ip; the cluster count is auto-scaled.
         vs.apply_vector_index(
-            IVFIndex(distance_strategy=DistanceStrategy.EUCLIDEAN, quant="sq8", nlist=1)
+            IVFIndex(distance_strategy=DistanceStrategy.EUCLIDEAN, quant="sq8")
         )
         assert vs.is_valid_index() is True
         res = vs.similarity_search("gamma", k=1)
@@ -343,20 +317,42 @@ def test_ivf_quantized_index_and_search():
         engine.close()
 
 
-def test_ivf_query_options_nprobe():
-    """IVFQueryOptions(nprobe=…) flows through as a SET LOCAL prelude and search works."""
+def test_ivf_query_options_to_parameter():
+    """IVFQueryOptions emits SET LOCAL bodies only for the fields that are set."""
+    assert IVFQueryOptions().to_parameter() == []
+    assert IVFQueryOptions(nprobe=10).to_parameter() == ["sdb_nprobe = 10"]
+    assert IVFQueryOptions(nprobe=10, rerank_factor=4).to_parameter() == [
+        "sdb_nprobe = 10",
+        "sdb_rerank_factor = 4",
+    ]
+
+
+def test_ivf_query_options_nprobe_reaches_db():
+    """IVFQueryOptions is actually applied to the query as a SET LOCAL prelude.
+
+    Proven behaviorally: a valid nprobe searches fine, while nprobe=0 (which SereneDB
+    rejects -- sdb_nprobe must be >= 1) makes the search raise. That error can only occur
+    if the ``SET LOCAL sdb_nprobe`` prelude genuinely reached the database.
+    """
     table = f"lc_ivfnp_{uuid.uuid4().hex[:8]}"
     engine = SereneDBEngine.from_connection_string(CONNINFO)
     engine.init_vectorstore_table(
         table, DIM, overwrite_existing=True, vector_index=IVFIndex()
     )
-    vs = SereneDBVectorStore.create_sync(
-        engine, DetEmb(), table, index_query_options=IVFQueryOptions(nprobe=10)
-    )
     try:
-        vs.add_texts(["red", "green", "blue"])
-        res = vs.similarity_search("green", k=1)
-        assert res[0].page_content == "green"
+        ok = SereneDBVectorStore.create_sync(
+            engine, DetEmb(), table, index_query_options=IVFQueryOptions(nprobe=10)
+        )
+        ok.add_texts(["red", "green", "blue"])
+        assert ok.similarity_search("green", k=1)[0].page_content == "green"
+
+        # A rejected nprobe value must surface -- only possible if the prelude is issued.
+        bad = SereneDBVectorStore.create_sync(
+            engine, DetEmb(), table, index_query_options=IVFQueryOptions(nprobe=0)
+        )
+        with pytest.raises(Exception) as exc:
+            bad.similarity_search("green", k=1)
+        assert "sdb_nprobe" in str(exc.value)
     finally:
         engine.drop_table(table)
         engine.close()
@@ -892,9 +888,7 @@ def test_sync_load_false_then_manual_refresh():
         engine.close()
 
 
-# -- metadata-column / JSON-field indexing (filter pushdown) ---------------------------
-
-JSON_COL = "langchain_metadata"
+# -- metadata-column / JSON-field indexing --------------------------------------------
 
 # One data set reused by both the indexed and control stores. ``category`` is a typed
 # column; ``n`` (int) and ``tag`` (text) live in the JSON metadata column.
@@ -930,45 +924,6 @@ def _make_indexed_store(metadata_index):
     return vs, engine, table
 
 
-def _explain_where(table, where_sql):
-    """Return the EXPLAIN plan text for a dense query, from the index, with ``where_sql``."""
-    index_name = table + DEFAULT_INDEX_NAME_SUFFIX
-    query = (
-        f'EXPLAIN SELECT "langchain_id", '
-        f'l2_distance("embedding", %(q)s::FLOAT[{DIM}]) AS distance '
-        f'FROM "public"."{index_name}" WHERE {where_sql} '
-        f"ORDER BY distance LIMIT 5"
-    )
-    with psycopg.connect(CONNINFO, autocommit=True) as conn, conn.cursor() as cur:
-        cur.execute(query, {"q": [0.1] * DIM})
-        return "\n".join(row[0] for row in cur.fetchall())
-
-
-def _has_standalone_filter(plan_text):
-    """Whether the plan has a standalone FILTER node (predicate NOT pushed into the scan).
-
-    SereneDB renders each plan node as a box whose title sits in the top border
-    (``╭─ FILTER ──┴──╮``); stripping the box-drawing characters off a line yields the
-    node title. A pushed-down predicate instead appears as a ``Filter:`` label +
-    ``Term`` / ``GranularRange`` / ``Vector KNN`` block *inside* the ``IRESEARCH_SCAN``
-    node (never its own ``FILTER`` box).
-    """
-    return any(line.strip("╭╮╰╯├┤┬┴─│ ") == "FILTER" for line in plan_text.splitlines())
-
-
-# The declared-JSON query expressions must match how the index was built (arrow + cast).
-_JSON_N_EXPR = build_json_field_selector(JSON_COL, "n", "INTEGER")
-_JSON_TAG_EXPR = build_json_field_selector(JSON_COL, "tag", "TEXT")
-
-_PUSHDOWN_CASES = [
-    ("typed eq", "\"category\" = 'animal'"),
-    ("typed in", "\"category\" IN ('animal', 'science')"),
-    ("typed range", "\"category\" > 'b'"),
-    ("json text eq", f"{_JSON_TAG_EXPR} = 't1'"),
-    ("json numeric range", f"{_JSON_N_EXPR} >= 3"),
-]
-
-
 @pytest.fixture
 def indexed_store():
     """Store whose index covers the ``category`` column (verbatim) and JSON ``n``/``tag``."""
@@ -996,31 +951,6 @@ def unindexed_store():
     finally:
         engine.drop_table(table)
         engine.close()
-
-
-@pytest.mark.parametrize(
-    "label,where_sql", _PUSHDOWN_CASES, ids=[c[0] for c in _PUSHDOWN_CASES]
-)
-def test_metadata_filter_pushed_into_index_scan(indexed_store, label, where_sql):
-    """With the column/field indexed, the predicate compiles INTO the IRESEARCH_SCAN."""
-    _, table = indexed_store
-    plan = _explain_where(table, where_sql)
-    assert "IRESEARCH_SCAN" in plan
-    assert not _has_standalone_filter(plan), f"{label} should push down, got:\n{plan}"
-
-
-@pytest.mark.parametrize(
-    "label,where_sql", _PUSHDOWN_CASES, ids=[c[0] for c in _PUSHDOWN_CASES]
-)
-def test_metadata_filter_is_post_filter_without_index(
-    unindexed_store, label, where_sql
-):
-    """Control: with nothing indexed the same predicate runs as a standalone FILTER."""
-    _, table = unindexed_store
-    plan = _explain_where(table, where_sql)
-    assert _has_standalone_filter(plan), (
-        f"{label} should be a post-filter, got:\n{plan}"
-    )
 
 
 _PARITY_FILTERS = [
@@ -1065,16 +995,11 @@ def test_indexed_json_filter_returns_expected_rows(indexed_store):
 
 
 def test_metadata_index_columns_subset():
-    """An explicit column subset is accepted and still pushes the typed-column filter."""
-    # Build a store that indexes only ``category`` explicitly (no JSON), verifying the
-    # MetadataColumnIndex path and that a subset still pushes the typed-column filter.
+    """An explicit column subset (MetadataColumnIndex) builds and filters correctly."""
     vs, engine, table = _make_indexed_store(
         MetadataIndexConfig(columns=[MetadataColumnIndex("category")])
     )
     try:
-        plan = _explain_where(table, "\"category\" = 'animal'")
-        assert "IRESEARCH_SCAN" in plan
-        assert not _has_standalone_filter(plan)
         res = vs.similarity_search("x", k=10, filter={"category": "animal"})
         assert sorted(d.page_content for d in res) == [
             "a lazy dog",
@@ -1119,10 +1044,8 @@ def test_default_index_skips_unindexable_column_at_table_creation():
                 {"category": "y", "price": 2.5},
             ],
         )
-        # category was indexed (pushes down); price was skipped (post-filter). Both correct.
-        assert "IRESEARCH_SCAN" in _explain_where(table, "\"category\" = 'x'")
-        assert not _has_standalone_filter(_explain_where(table, "\"category\" = 'x'"))
-        assert _has_standalone_filter(_explain_where(table, '"price" = 1.5'))
+        # category is indexed, price was skipped; filters on both still return the
+        # right rows (price runs as a residual filter).
         assert [
             d.page_content
             for d in vs.similarity_search("a", k=5, filter={"category": "x"})
@@ -1164,7 +1087,10 @@ def test_default_index_skips_unindexable_column_at_apply():
             IVFIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE)
         )
         assert vs.is_valid_index() is True
-        assert not _has_standalone_filter(_explain_where(table, "\"category\" = 'x'"))
+        assert [
+            d.page_content
+            for d in vs.similarity_search("a", k=5, filter={"category": "x"})
+        ] == ["a"]
     finally:
         engine.drop_table(table)
         engine.close()

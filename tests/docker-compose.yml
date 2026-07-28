@@ -22,9 +22,16 @@ name: langchain-serenedb-tests
 services:
   serened:
     image: ${SERENEDB_IMAGE:-serenedb/serenedb:latest}
-    # The image's entrypoint starts serened (listening on 7890) with its data dir at
-    # /var/lib/serenedb, so no command is needed. Data lives on the container's writable
-    # layer and is discarded on removal -- what we want for isolated test runs.
+    # The image's entrypoint starts serened (listening on 0.0.0.0:7890) with its data dir
+    # at /var/lib/serenedb, so no command is needed. Data lives on the container's
+    # writable layer and is discarded on removal -- what we want for isolated test runs.
+    environment:
+      # This image refuses passwordless connections over the network (only a loopback
+      # superuser is trusted), and the tests container reaches it over the Docker
+      # network. serened reads POSTGRES_PASSWORD at first init to set the `postgres`
+      # superuser password; the tests connect with the same value (see SERENEDB_PASSWORD
+      # below). Data dir is fresh each run, so this is applied every time.
+      POSTGRES_PASSWORD: ${SERENEDB_PASSWORD:-postgres}
     expose:
       - "7890"
     # Uncomment to also reach the instance from the host (e.g. for debugging):
@@ -49,6 +56,9 @@ services:
       # SERENEDB_WAIT_TIMEOUT seconds), covering the time the image needs to boot.
       SERENEDB_HOST: serened
       SERENEDB_PORT: "7890"
+      # Must match the serened service's POSTGRES_PASSWORD above; run.sh folds this into
+      # the conninfo it builds (and passes to pytest) as `password=...`.
+      SERENEDB_PASSWORD: ${SERENEDB_PASSWORD:-postgres}
       SERENEDB_WAIT_TIMEOUT: "60"
       # Force the image's interpreter; otherwise run.sh would prefer a .venv/bin/python
       # from the mounted repo, which is built for the host.
