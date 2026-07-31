@@ -30,7 +30,7 @@ from langchain_core.vectorstores import VectorStore
 from langchain_core.vectorstores import utils as lc_utils
 
 from .engine import SereneDBEngine
-from .hybrid_search_config import HybridSearchConfig
+from .hybrid_search_config import FusionStrategy, HybridSearchConfig
 from .indexes import (
     DEFAULT_DISTANCE_STRATEGY,
     DEFAULT_INDEX_NAME_SUFFIX,
@@ -588,40 +588,131 @@ class AsyncSereneDBVectorStore(VectorStore):
             ]
         return await self._aquery(query, params, prelude=prelude)
 
-    async def _asparse_query(
+    async def _ahybrid_query(
         self,
-        hybrid_search_config: HybridSearchConfig,
+        embedding: list[float],
+        cfg: HybridSearchConfig,
         fts_query: str,
         *,
-        limit: int,
+        k: int,
         filter: Optional[dict] = None,
     ) -> list[dict[str, Any]]:
-        """Run the lexical (BM25) branch against the inverted index by name."""
-        column_names = self._select_columns(include_embedding=False)
-        schema_name = self.engine._escape_identifier(self.schema_name)
-        index_name = self.engine._escape_identifier(self._vector_index_name)
-        scorer = hybrid_search_config.scorer
-        tsquery_fn = hybrid_search_config.tsquery_function
+        """Fuse the lexical (BM25) and vector rankings in ONE SereneDB query.
+
+        Both branches select from the combined inverted index by name (BM25 needs the
+        index ``tableoid``; the vector ANN routes through the same index), each capped at
+        its own per-branch window and ranked/scored in a ``WITH`` CTE. The outer query
+        combines them per :attr:`HybridSearchConfig.fusion` and joins the base table back
+        to project the content/metadata columns. The fused score (higher = better) is
+        emitted under :attr:`_distance_alias`.
+        """
+        dim = len(embedding)
+        esc = self.engine._escape_identifier
+        schema = esc(self.schema_name)
+        index = esc(self._vector_index_name)
+        table = esc(self.table_name)
+        operator = self.distance_strategy.operator
+        alias = self._distance_alias
 
         safe_filter, filter_dict = (None, None)
         if filter and isinstance(filter, dict):
             safe_filter, filter_dict = self._create_filter_clause(filter)
-        and_filters = f"AND ({safe_filter})" if safe_filter else ""
+        lex_and = f" AND ({safe_filter})" if safe_filter else ""
+        vec_where = f"WHERE ({safe_filter})" if safe_filter else ""
 
-        # Schema-qualify the index (a bare name does not resolve in a non-public schema);
-        # the relation's implicit alias is the bare index name, so tableoid uses that.
-        alias = self._distance_alias
-        query = (
-            f'SELECT {column_names}, {scorer}("{index_name}".tableoid) AS "{alias}" '
-            f'FROM "{schema_name}"."{index_name}" '
-            f'WHERE "{self.content_column}" @@ {tsquery_fn}(%(fts_query)s) {and_filters} '
-            f'ORDER BY "{alias}" DESC, "{self.id_column}" '
-            f"LIMIT %(sparse_limit)s;"
+        # Inner branch subqueries, each producing (fid, sc): lexical BM25 (higher better)
+        # and vector distance (smaller better). Both read from the index by name.
+        lex_inner = (
+            f'SELECT "{self.id_column}" AS fid, '
+            f'{cfg.scorer}("{index}".tableoid) AS sc '
+            f'FROM "{schema}"."{index}" '
+            f'WHERE "{self.content_column}" @@ {cfg.tsquery_function}(%(fts_query)s)'
+            f"{lex_and} "
+            f"ORDER BY sc DESC LIMIT %(lex_window)s"
         )
-        params: dict[str, Any] = {"fts_query": fts_query, "sparse_limit": limit}
+        vec_inner = (
+            f'SELECT "{self.id_column}" AS fid, '
+            f'"{self.embedding_column}" {operator} %(query_embedding)s::FLOAT[{dim}] AS sc '
+            f'FROM "{schema}"."{index}" '
+            f"{vec_where} "
+            f"ORDER BY sc LIMIT %(vec_window)s"
+        )
+
+        params: dict[str, Any] = {
+            "fts_query": fts_query,
+            "query_embedding": [float(d) for d in embedding],
+            "lex_window": cfg.secondary_top_k,
+            "vec_window": cfg.primary_top_k,
+            "final_k": k,
+        }
         if filter_dict:
             params.update(filter_dict)
-        return await self._aquery(query, params)
+
+        # Per-strategy CTE producing (fid, _score); _score is higher-is-better.
+        if cfg.fusion == FusionStrategy.RRF:
+            with_prefix = (
+                f"WITH fused AS ("
+                f"SELECT fid, RANK() OVER (ORDER BY sc DESC) AS rnk FROM ({lex_inner}) lex "
+                f"UNION ALL "
+                f"SELECT fid, RANK() OVER (ORDER BY sc) AS rnk FROM ({vec_inner}) vec) "
+            )
+            scored = (
+                "SELECT fid, SUM(1.0 / (%(rrf_k)s + rnk)) AS _score "
+                "FROM fused GROUP BY fid"
+            )
+            params["rrf_k"] = cfg.rrf_k
+        elif cfg.fusion == FusionStrategy.NORMALIZED:
+            # branch 1 = lexical (higher better), branch 2 = vector (distance -> invert).
+            with_prefix = (
+                f"WITH hits AS ("
+                f"SELECT 1 AS branch, fid, sc FROM ({lex_inner}) lex "
+                f"UNION ALL "
+                f"SELECT 2 AS branch, fid, sc FROM ({vec_inner}) vec), "
+                f"normed AS (SELECT fid, ("
+                f"CASE WHEN MAX(sc) OVER w = MIN(sc) OVER w THEN 1.0 "
+                f"WHEN branch = 2 THEN (MAX(sc) OVER w - sc) / "
+                f"(MAX(sc) OVER w - MIN(sc) OVER w) "
+                f"ELSE (sc - MIN(sc) OVER w) / (MAX(sc) OVER w - MIN(sc) OVER w) END"
+                f") * (CASE WHEN branch = 2 THEN %(w_primary)s ELSE %(w_secondary)s END) "
+                f"AS ns FROM hits WINDOW w AS (PARTITION BY branch)) "
+            )
+            scored = "SELECT fid, SUM(ns) AS _score FROM normed GROUP BY fid"
+            params["w_primary"] = cfg.primary_results_weight
+            params["w_secondary"] = cfg.secondary_results_weight
+        elif cfg.fusion == FusionStrategy.WEIGHTED_SUM:
+            # Raw weighted sum; negate the vector distance so higher = better.
+            with_prefix = (
+                f"WITH hits AS ("
+                f"SELECT fid, (%(w_secondary)s * sc) AS contrib FROM ({lex_inner}) lex "
+                f"UNION ALL "
+                f"SELECT fid, (%(w_primary)s * (-sc)) AS contrib FROM ({vec_inner}) vec) "
+            )
+            scored = "SELECT fid, SUM(contrib) AS _score FROM hits GROUP BY fid"
+            params["w_primary"] = cfg.primary_results_weight
+            params["w_secondary"] = cfg.secondary_results_weight
+        else:  # pragma: no cover - defensive
+            raise ValueError(f"Unknown fusion strategy: {cfg.fusion}")
+
+        proj = [self.id_column, self.content_column, *self.metadata_columns]
+        if self.metadata_json_column:
+            proj.append(self.metadata_json_column)
+        m_cols = ", ".join(f'm."{c}"' for c in proj)
+
+        query = (
+            f"{with_prefix}"
+            f'SELECT {m_cols}, f._score AS "{alias}" '
+            f"FROM ({scored}) f "
+            f'JOIN "{schema}"."{table}" m ON m."{self.id_column}" = f.fid '
+            f'ORDER BY f._score DESC, m."{self.id_column}" '
+            f"LIMIT %(final_k)s;"
+        )
+
+        prelude = None
+        if self.index_query_options:
+            prelude = [
+                f"SET LOCAL {opt};" for opt in self.index_query_options.to_parameter()
+            ]
+        return await self._aquery(query, params, prelude=prelude)
 
     async def _aquery_collection(
         self,
@@ -631,39 +722,20 @@ class AsyncSereneDBVectorStore(VectorStore):
         filter: Optional[dict] = None,
         **kwargs: Any,
     ) -> list[dict[str, Any]]:
-        """Dense search, or hybrid (dense + BM25 fused) when configured."""
+        """Dense search, or a single-query hybrid (BM25 + vector fused) when configured."""
         hybrid_search_config = kwargs.get(
             "hybrid_search_config", self.hybrid_search_config
         )
         final_k = k if k is not None else self.k
-        dense_limit = (
-            hybrid_search_config.primary_top_k if hybrid_search_config else final_k
-        )
-        dense_rows = await self._adense_query(
-            embedding, limit=dense_limit, filter=filter
-        )
 
         fts_query = ""
         if hybrid_search_config:
             fts_query = hybrid_search_config.fts_query or kwargs.get("fts_query", "")
         if hybrid_search_config and fts_query:
-            sparse_rows = await self._asparse_query(
-                hybrid_search_config,
-                fts_query,
-                limit=hybrid_search_config.secondary_top_k,
-                filter=filter,
+            return await self._ahybrid_query(
+                embedding, hybrid_search_config, fts_query, k=final_k, filter=filter
             )
-            fusion_params = dict(hybrid_search_config.fusion_function_parameters)
-            fusion_params["fetch_top_k"] = final_k
-            combined = hybrid_search_config.fusion_function(
-                dense_rows,
-                sparse_rows,
-                **fusion_params,
-                distance_strategy=self.distance_strategy,
-                distance_key=self._distance_alias,
-            )
-            return list(combined)
-        return dense_rows
+        return await self._adense_query(embedding, limit=final_k, filter=filter)
 
     async def asimilarity_search(
         self,

@@ -1,194 +1,41 @@
-"""Hybrid search configuration and fusion functions for SereneDBVectorStore.
+"""Hybrid search configuration for SereneDBVectorStore.
 
-The fusion functions (:func:`weighted_sum_ranking`, :func:`reciprocal_rank_fusion`) are
-pure Python: they merge two already-ranked result lists (a dense vector branch and a
-lexical BM25 branch) into a single ranking.
-
-The lexical branch indexes the ``content`` column in an inverted index (with a text
-search dictionary carrying ``frequency = true``) and scores matches with
-``BM25(index.tableoid)``. See :class:`HybridSearchConfig`.
+Hybrid search fuses a dense (vector ANN) ranking and a lexical (BM25 full-text) ranking
+in a **single** SereneDB query — a ``WITH fused AS (lexical UNION ALL vector)`` CTE whose
+outer query combines the two per the chosen :class:`FusionStrategy`. The lexical branch
+indexes the ``content`` column in an inverted index (with a text search dictionary
+carrying ``frequency = true``) and scores matches with ``BM25(index.tableoid)``.
+See :class:`HybridSearchConfig`.
 """
 
-from abc import ABC
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
-from typing import Any, Callable
-
-from .indexes import DistanceStrategy
-
-Row = Mapping[str, Any]
+import enum
+from dataclasses import dataclass
 
 
-def _normalize_scores(
-    results: Sequence[dict[str, Any]], is_distance_metric: bool
-) -> Sequence[dict[str, Any]]:
-    """Normalizes scores to a 0-1 scale, where 1 is best."""
-    if not results:
-        return []
+class FusionStrategy(str, enum.Enum):
+    """How the lexical (BM25) and vector rankings are combined into one score.
 
-    # Get scores from the last column of each result
-    scores = [float(list(item.values())[-1]) for item in results]
-    min_score, max_score = min(scores), max(scores)
-    score_range = max_score - min_score
-
-    if score_range == 0:
-        # All documents are of the highest quality (1.0)
-        for item in results:
-            item["normalized_score"] = 1.0
-        return list(results)
-
-    for item in results:
-        # Access the score again from the last column for calculation
-        score = list(item.values())[-1]
-        normalized = (score - min_score) / score_range
-        if is_distance_metric:
-            # For distance, a lower score is better, so we invert the result.
-            item["normalized_score"] = 1.0 - normalized
-        else:
-            # For similarity (like keyword search), a higher score is better.
-            item["normalized_score"] = normalized
-
-    return list(results)
-
-
-def weighted_sum_ranking(
-    primary_search_results: Sequence[Row],
-    secondary_search_results: Sequence[Row],
-    primary_results_weight: float = 0.5,
-    secondary_results_weight: float = 0.5,
-    fetch_top_k: int = 4,
-    **kwargs: Any,
-) -> Sequence[dict[str, Any]]:
-    """Ranks documents using a weighted sum of scores from two sources.
-
-    Args:
-        primary_search_results: A list of (document, distance) tuples from
-            the primary (vector) search.
-        secondary_search_results: A list of (document, distance) tuples from
-            the secondary (keyword/BM25) search.
-        primary_results_weight: The weight for the primary source's scores.
-        secondary_results_weight: The weight for the secondary source's scores.
-        fetch_top_k: The number of documents to fetch after merging the results.
-
-    Returns:
-        A list of rows, sorted by weighted score in descending order.
+    - ``RRF`` (the default): Reciprocal Rank Fusion — combine *ranks*, not scores, with
+      ``sum(1 / (rrf_k + rank))``. Scale-free, so BM25 and vector distance fuse as-is
+      with no per-branch weights. Choose it when consensus should win: a document several
+      signals agree on beats one only a single signal likes.
+    - ``NORMALIZED``: min-max normalize each branch's scores to ``[0, 1]`` (the vector
+      distance branch is inverted so nearer = higher), then take a weighted sum. Keeps
+      score margins, so a decisive win in one branch can outrank lukewarm presence in
+      several; the trade-off is that one outlier rescales its whole branch.
+    - ``WEIGHTED_SUM``: a plain weighted sum of the *raw* branch scores
+      (``primary_results_weight * vector + secondary_results_weight * bm25``). Keeps
+      magnitudes with no min-max distortion, but is only meaningful when the branches are
+      already on comparable scales — BM25 and a raw vector distance usually are not.
     """
-    distance_strategy = kwargs.get(
-        "distance_strategy", DistanceStrategy.COSINE_DISTANCE
-    )
-    is_primary_distance = distance_strategy != DistanceStrategy.INNER_PRODUCT
-    # The result-row key the fused score is written under; the vector store picks a
-    # non-colliding alias when a real column is named "distance".
-    distance_key = kwargs.get("distance_key", "distance")
 
-    # Normalize both sets of results onto a 0-1 scale
-    normalized_primary = _normalize_scores(
-        [dict(row) for row in primary_search_results],
-        is_distance_metric=is_primary_distance,
-    )
-
-    # Keyword search relevance is a similarity score (higher is better)
-    normalized_secondary = _normalize_scores(
-        [dict(row) for row in secondary_search_results], is_distance_metric=False
-    )
-
-    # stores computed metric with provided distance metric and weights
-    weighted_scores: dict[str, dict[str, Any]] = {}
-
-    # Process primary results
-    for item in normalized_primary:
-        doc_id = str(list(item.values())[0])
-        item[distance_key] = item["normalized_score"] * primary_results_weight
-        weighted_scores[doc_id] = item
-
-    # Process secondary results
-    for item in normalized_secondary:
-        doc_id = str(list(item.values())[0])
-        secondary_weighted_score = item["normalized_score"] * secondary_results_weight
-
-        if doc_id in weighted_scores:
-            weighted_scores[doc_id][distance_key] += secondary_weighted_score
-        else:
-            item[distance_key] = secondary_weighted_score
-            weighted_scores[doc_id] = item
-
-    ranked_results = sorted(
-        weighted_scores.values(), key=lambda item: item[distance_key], reverse=True
-    )
-
-    for result in ranked_results:
-        result.pop("normalized_score", None)
-
-    return ranked_results[:fetch_top_k]
-
-
-def reciprocal_rank_fusion(
-    primary_search_results: Sequence[Row],
-    secondary_search_results: Sequence[Row],
-    rrf_k: float = 60,
-    fetch_top_k: int = 4,
-    **kwargs: Any,
-) -> Sequence[dict[str, Any]]:
-    """Ranks documents using Reciprocal Rank Fusion (RRF) of two sources.
-
-    Args:
-        primary_search_results: A list of (document, distance) tuples from
-            the primary (vector) search.
-        secondary_search_results: A list of (document, distance) tuples from
-            the secondary (keyword/BM25) search.
-        rrf_k: The RRF parameter k.
-        fetch_top_k: The number of documents to fetch after merging the results.
-
-    Returns:
-        A list of rows, sorted by RRF score in descending order.
-    """
-    rrf_scores: dict[str, dict[str, Any]] = {}
-
-    # Determine sorting order based on the vector distance strategy.
-    # For COSINE & EUCLIDEAN (distance), we sort ascending (reverse=False).
-    # For INNER_PRODUCT (similarity), we sort descending (reverse=True).
-    distance_strategy = kwargs.get(
-        "distance_strategy", DistanceStrategy.COSINE_DISTANCE
-    )
-    # The result-row key the fused score is read/written under; the vector store picks a
-    # non-colliding alias when a real column is named "distance".
-    distance_key = kwargs.get("distance_key", "distance")
-    is_similarity_metric = distance_strategy == DistanceStrategy.INNER_PRODUCT
-    sorted_primary = sorted(
-        primary_search_results,
-        key=lambda item: item[distance_key],
-        reverse=is_similarity_metric,
-    )
-
-    for rank, row in enumerate(sorted_primary):
-        doc_id = str(list(row.values())[0])
-        if doc_id not in rrf_scores:
-            rrf_scores[doc_id] = dict(row)
-            rrf_scores[doc_id][distance_key] = 0.0
-        rrf_scores[doc_id][distance_key] += 1.0 / (rank + rrf_k)
-
-    # Keyword search relevance is always "higher is better" -> sort descending
-    sorted_secondary = sorted(
-        secondary_search_results,
-        key=lambda item: item[distance_key],
-        reverse=True,
-    )
-
-    for rank, row in enumerate(sorted_secondary):
-        doc_id = str(list(row.values())[0])
-        if doc_id not in rrf_scores:
-            rrf_scores[doc_id] = dict(row)
-            rrf_scores[doc_id][distance_key] = 0.0
-        rrf_scores[doc_id][distance_key] += 1.0 / (rank + rrf_k)
-
-    ranked_results = sorted(
-        rrf_scores.values(), key=lambda item: item[distance_key], reverse=True
-    )
-    return ranked_results[:fetch_top_k]
+    RRF = "rrf"
+    NORMALIZED = "normalized"
+    WEIGHTED_SUM = "weighted_sum"
 
 
 @dataclass
-class HybridSearchConfig(ABC):
+class HybridSearchConfig:
     """SereneDB vector store hybrid-search configuration.
 
     The lexical branch is served by an inverted index on the ``content`` column.
@@ -200,11 +47,16 @@ class HybridSearchConfig(ABC):
 
     Attributes:
         fts_query: The full-text query string. If empty, the search query text is used.
-        fusion_function: Callable that merges the vector and keyword result lists.
-            Defaults to :func:`weighted_sum_ranking`.
-        fusion_function_parameters: Extra kwargs forwarded to ``fusion_function``.
-        primary_top_k: Rows to fetch from the vector branch before fusion.
-        secondary_top_k: Rows to fetch from the keyword branch before fusion.
+        fusion: How the two rankings are combined (see :class:`FusionStrategy`). Defaults
+            to :attr:`FusionStrategy.RRF`.
+        rrf_k: The RRF ``k`` constant (used only when ``fusion`` is ``RRF``). Higher ``k``
+            flattens the weight of top ranks; ``60`` is the published default.
+        primary_results_weight: Weight of the vector branch for the ``NORMALIZED`` and
+            ``WEIGHTED_SUM`` strategies.
+        secondary_results_weight: Weight of the lexical (BM25) branch for the
+            ``NORMALIZED`` and ``WEIGHTED_SUM`` strategies.
+        primary_top_k: Per-branch window — rows the vector branch contributes to fusion.
+        secondary_top_k: Per-branch window — rows the keyword branch contributes.
         dictionary_name: Text search dictionary used to analyze the content column.
         dictionary_options: Options for ``CREATE TEXT SEARCH DICTIONARY`` — must include
             ``frequency = true`` for scoring.
@@ -214,10 +66,10 @@ class HybridSearchConfig(ABC):
     """
 
     fts_query: str = ""
-    fusion_function: Callable[[Sequence[Row], Sequence[Row], Any], Sequence[Any]] = (
-        weighted_sum_ranking
-    )
-    fusion_function_parameters: dict[str, Any] = field(default_factory=dict)
+    fusion: FusionStrategy = FusionStrategy.RRF
+    rrf_k: int = 60
+    primary_results_weight: float = 0.5
+    secondary_results_weight: float = 0.5
     primary_top_k: int = 4
     secondary_top_k: int = 4
     dictionary_name: str = "langchain_fts_dict"

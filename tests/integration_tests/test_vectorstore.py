@@ -16,6 +16,7 @@ from langchain_core.embeddings import Embeddings
 from langchain_serenedb import (
     Column,
     DistanceStrategy,
+    FusionStrategy,
     HybridSearchConfig,
     IVFIndex,
     IVFQueryOptions,
@@ -24,7 +25,6 @@ from langchain_serenedb import (
     MetadataIndexConfig,
     SereneDBEngine,
     SereneDBVectorStore,
-    reciprocal_rank_fusion,
 )
 
 CONNINFO = os.environ.get(
@@ -465,13 +465,12 @@ def test_init_creates_hybrid_index():
         engine.close()
 
 
-def test_rrf_fusion():
-    table = f"lc_rrf_{uuid.uuid4().hex[:8]}"
+def _run_fusion_strategy(fusion: FusionStrategy):
+    """Build a hybrid store using the given single-query fusion strategy and search it."""
+    table = f"lc_fuse_{uuid.uuid4().hex[:8]}"
     engine = SereneDBEngine.from_connection_string(CONNINFO)
     engine.init_vectorstore_table(table, DIM, overwrite_existing=True)
-    cfg = HybridSearchConfig(
-        primary_top_k=10, secondary_top_k=10, fusion_function=reciprocal_rank_fusion
-    )
+    cfg = HybridSearchConfig(primary_top_k=10, secondary_top_k=10, fusion=fusion)
     vs = SereneDBVectorStore.create_sync(
         engine, DetEmb(), table, hybrid_search_config=cfg
     )
@@ -480,9 +479,23 @@ def test_rrf_fusion():
     try:
         res = vs.similarity_search("brown dog", k=3)
         assert len(res) >= 1
+        with_score = vs.similarity_search_with_score("brown dog", k=2)
+        assert with_score and all(isinstance(s, float) for _, s in with_score)
     finally:
         engine.drop_table(table)
         engine.close()
+
+
+def test_rrf_fusion():
+    _run_fusion_strategy(FusionStrategy.RRF)
+
+
+def test_normalized_fusion():
+    _run_fusion_strategy(FusionStrategy.NORMALIZED)
+
+
+def test_weighted_sum_fusion():
+    _run_fusion_strategy(FusionStrategy.WEIGHTED_SUM)
 
 
 def test_vector_search_in_non_public_schema():
@@ -1174,7 +1187,7 @@ def test_distance_named_metadata_column_hybrid():
         metadata_columns=[Column("distance", "TEXT")],
     )
     cfg = HybridSearchConfig(
-        primary_top_k=10, secondary_top_k=10, fusion_function=reciprocal_rank_fusion
+        primary_top_k=10, secondary_top_k=10, fusion=FusionStrategy.RRF
     )
     vs = SereneDBVectorStore.create_sync(
         engine, DetEmb(), table, metadata_columns=["distance"], hybrid_search_config=cfg

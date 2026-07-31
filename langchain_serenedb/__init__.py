@@ -10,9 +10,8 @@ from importlib import metadata
 from langchain_serenedb.async_vectorstore import AsyncSereneDBVectorStore
 from langchain_serenedb.engine import Column, ColumnDict, SereneDBEngine
 from langchain_serenedb.hybrid_search_config import (
+    FusionStrategy,
     HybridSearchConfig,
-    reciprocal_rank_fusion,
-    weighted_sum_ranking,
 )
 from langchain_serenedb.indexes import (
     DistanceStrategy,
@@ -36,6 +35,7 @@ __all__ = [
     "Column",
     "ColumnDict",
     "DistanceStrategy",
+    "FusionStrategy",
     "HybridSearchConfig",
     "IVFIndex",
     "IVFQueryOptions",
@@ -44,6 +44,4 @@ __all__ = [
     "MetadataIndexConfig",
     "SereneDBEngine",
     "SereneDBVectorStore",
-    "reciprocal_rank_fusion",
-    "weighted_sum_ranking",
 ]
