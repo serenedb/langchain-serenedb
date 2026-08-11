@@ -1288,6 +1288,112 @@ def test_fts_phrase(fts_store):
     assert _fts_cats(fts_store, {"category": {"$phrase": "drama"}}) == ["drama"]
 
 
+def _make_phrase_store(titles):
+    """Store whose ``title`` column is indexed with a position-enabled dictionary.
+
+    ts_phrase matches token positions, so the column must be tokenized by a dictionary
+    with ``position = true``; the user sets that up, as we do here explicitly. Returns
+    ``(vs, engine, table, dict_name)`` for cleanup via :func:`_drop_phrase_store`.
+    """
+    table = f"lc_phr_{uuid.uuid4().hex[:8]}"
+    dict_name = f"phr_dict_{uuid.uuid4().hex[:8]}"
+    engine = SereneDBEngine.from_connection_string(CONNINFO)
+    engine.init_vectorstore_table(
+        table, DIM, overwrite_existing=True, metadata_columns=[Column("title", "TEXT")]
+    )
+    engine._run_as_sync(
+        engine._aexecute(
+            f'CREATE TEXT SEARCH DICTIONARY "public"."{dict_name}" '
+            "(template = 'segmentation', case = 'lower', "
+            "frequency = true, position = true)"
+        )
+    )
+    mi = MetadataIndexConfig(
+        columns=[MetadataColumnIndex("title", dictionary=dict_name)]
+    )
+    vs = SereneDBVectorStore.create_sync(
+        engine,
+        DetEmb(),
+        table,
+        metadata_columns=["title"],
+        distance_strategy=DistanceStrategy.COSINE_DISTANCE,
+        metadata_index=mi,
+    )
+    vs.add_texts(
+        [f"d{i}" for i in range(len(titles))],
+        metadatas=[{"title": t} for t in titles],
+    )
+    vs.apply_vector_index(IVFIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE))
+    return vs, engine, table, dict_name
+
+
+def _drop_phrase_store(engine, table, dict_name):
+    engine.drop_table(table)
+    engine._run_as_sync(
+        engine._aexecute(
+            f'DROP TEXT SEARCH DICTIONARY IF EXISTS "public"."{dict_name}"'
+        )
+    )
+    engine.close()
+
+
+def _titles(vs, flt):
+    return sorted(
+        d.metadata["title"] for d in vs.similarity_search("x", k=10, filter=flt)
+    )
+
+
+def test_fts_phrase_slop():
+    """$phrase slop budget matches near-adjacent tokens on a position-indexed column."""
+    vs, engine, table, dname = _make_phrase_store(["quick brown fox", "quick fox"])
+    try:
+        # Exact phrase matches only the adjacent "quick fox".
+        assert _titles(vs, {"title": {"$phrase": "quick fox"}}) == ["quick fox"]
+        # slop = 1 also admits "quick brown fox" (shifting `fox` one position).
+        assert _titles(
+            vs, {"title": {"$phrase": {"text": "quick fox", "slop": 1}}}
+        ) == [
+            "quick brown fox",
+            "quick fox",
+        ]
+    finally:
+        _drop_phrase_store(engine, table, dname)
+
+
+def test_fts_phrase_gaps():
+    """$phrase multi-segment gaps: exact int gap, [min, max] interval, gap+slop rules."""
+    vs, engine, table, dname = _make_phrase_store(
+        ["quick brown fox jumps over lazy dog", "quick red fox", "quick fox"]
+    )
+    try:
+        # Exactly one token between `quick` and `fox` (excludes the adjacent "quick fox").
+        assert _titles(vs, {"title": {"$phrase": ["quick", 1, "fox"]}}) == [
+            "quick brown fox jumps over lazy dog",
+            "quick red fox",
+        ]
+        # Interval: exactly 3 tokens (jumps over lazy) between `fox` and `dog`.
+        assert _titles(vs, {"title": {"$phrase": ["fox", [3, 3], "dog"]}}) == [
+            "quick brown fox jumps over lazy dog",
+        ]
+        # The [0, 2] interval excludes that 3-token gap.
+        assert _titles(vs, {"title": {"$phrase": ["fox", [0, 2], "dog"]}}) == []
+        # An integer gap may be combined with slop.
+        assert _titles(
+            vs, {"title": {"$phrase": {"text": ["quick", 1, "fox"], "slop": 1}}}
+        )
+        # An interval gap may not — rejected client-side before hitting the DB.
+        with pytest.raises(ValueError, match="interval"):
+            vs.similarity_search(
+                "x",
+                k=5,
+                filter={
+                    "title": {"$phrase": {"text": ["fox", [0, 2], "dog"], "slop": 1}}
+                },
+            )
+    finally:
+        _drop_phrase_store(engine, table, dname)
+
+
 def test_fts_operator_composes_with_logical(fts_store):
     got = _fts_cats(
         fts_store,

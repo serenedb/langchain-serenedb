@@ -67,12 +67,13 @@ LOGICAL_OPERATORS = {"$and", "$or", "$not"}
 FTS_UNARY_FUNCTIONS = {
     "$startswith": "ts_starts_with",  # prefix match
     "$regex": "ts_regexp",  # regular-expression match against indexed terms
-    "$phrase": "ts_phrase",  # ordered-adjacent phrase match
     "$fuzzy": "ts_levenshtein",  # typo-tolerant match (auto edit distance)
 }
-# $match -> ts_any (OR / N-of-M); $ngram -> ts_ngram (n-gram similarity; requires the
-# column to be indexed with an n-gram dictionary — not gate-checkable, DB-enforced).
-FTS_OPERATORS = set(FTS_UNARY_FUNCTIONS) | {"$match", "$ngram"}
+# Operators with their own argument handling:
+#   $match  -> ts_any (OR / N-of-M)
+#   $ngram  -> ts_ngram (n-gram similarity; needs an n-gram-dictionary column — DB-enforced)
+#   $phrase -> ts_phrase (ordered-adjacent phrase, with optional `slop` proximity budget)
+FTS_OPERATORS = set(FTS_UNARY_FUNCTIONS) | {"$match", "$ngram", "$phrase"}
 
 SUPPORTED_OPERATORS = (
     set(COMPARISONS_TO_NATIVE)
@@ -1229,6 +1230,83 @@ class AsyncSereneDBVectorStore(VectorStore):
                 return (
                     f"({field_selector} @@ ts_ngram(%({tp})s, %({thp})s))",
                     fparams,
+                )
+
+            if operator == "$phrase":
+                # value forms:
+                #   "quick fox"                       -> ts_phrase('quick fox')
+                #   ["quick", 1, "fox"]               -> ts_phrase('quick', 1, 'fox')
+                #   ["fox", [0, 2], "dog"]            -> ts_phrase('fox', [0, 2], 'dog')
+                #   {"text": <str|list>, "slop": N}   -> ... , slop := N
+                # A list alternates text segments (bound params) with gaps: an int is an
+                # exact token gap, a [min, max] pair an interval. `slop` (a proximity
+                # budget) may accompany integer gaps but not an interval gap.
+                spec: Any = filter_value
+                slop = None
+                if isinstance(filter_value, dict):
+                    spec = filter_value.get("text")
+                    slop = filter_value.get("slop")
+                segments_gaps = [spec] if isinstance(spec, str) else spec
+                if not isinstance(segments_gaps, (list, tuple)) or not segments_gaps:
+                    raise ValueError(
+                        "$phrase expects a string, a [segment, gap, segment, ...] list, "
+                        "or {'text': <str|list>, 'slop': int}."
+                    )
+                if len(segments_gaps) % 2 == 0:
+                    raise ValueError(
+                        "$phrase list must alternate segment/gap and both start and end "
+                        "with a text segment (odd length)."
+                    )
+                parts: list[str] = []
+                pparams: dict[str, Any] = {}
+                has_interval = False
+                for i, item in enumerate(segments_gaps):
+                    if i % 2 == 0:  # text segment -> bound param
+                        if not isinstance(item, str) or not item:
+                            raise ValueError(
+                                "$phrase segments must be non-empty strings."
+                            )
+                        pn = f"{field_param_prefix}_ph{i}_{suffix_id}"
+                        pparams[pn] = item
+                        parts.append(f"%({pn})s")
+                    elif isinstance(item, int) and not isinstance(item, bool):
+                        if item < 0:
+                            raise ValueError(
+                                "$phrase gap must be a non-negative integer."
+                            )
+                        parts.append(str(item))
+                    elif (
+                        isinstance(item, (list, tuple))
+                        and len(item) == 2
+                        and all(
+                            isinstance(x, int) and not isinstance(x, bool) for x in item
+                        )
+                    ):
+                        lo, hi = item
+                        if lo < 0 or hi < lo:
+                            raise ValueError(
+                                "$phrase interval gap must be [min, max] with 0 <= min <= max."
+                            )
+                        parts.append(f"[{lo}, {hi}]")
+                        has_interval = True
+                    else:
+                        raise ValueError(
+                            "$phrase gap must be an int or a [min, max] pair of ints."
+                        )
+                inner = ", ".join(parts)
+                if slop is None:
+                    return f"({field_selector} @@ ts_phrase({inner}))", pparams
+                if isinstance(slop, bool) or not isinstance(slop, int) or slop < 0:
+                    raise ValueError("$phrase 'slop' must be a non-negative integer.")
+                if has_interval:
+                    raise ValueError(
+                        "$phrase 'slop' is incompatible with an interval [min, max] gap."
+                    )
+                sp = f"{field_param_prefix}_slop_{suffix_id}"
+                pparams[sp] = slop
+                return (
+                    f"({field_selector} @@ ts_phrase({inner}, slop := %({sp})s))",
+                    pparams,
                 )
 
             fn = FTS_UNARY_FUNCTIONS[operator]
