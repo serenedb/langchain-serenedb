@@ -70,7 +70,9 @@ FTS_UNARY_FUNCTIONS = {
     "$phrase": "ts_phrase",  # ordered-adjacent phrase match
     "$fuzzy": "ts_levenshtein",  # typo-tolerant match (auto edit distance)
 }
-FTS_OPERATORS = set(FTS_UNARY_FUNCTIONS) | {"$match"}  # $match -> ts_any (OR / N-of-M)
+# $match -> ts_any (OR / N-of-M); $ngram -> ts_ngram (n-gram similarity; requires the
+# column to be indexed with an n-gram dictionary — not gate-checkable, DB-enforced).
+FTS_OPERATORS = set(FTS_UNARY_FUNCTIONS) | {"$match", "$ngram"}
 
 SUPPORTED_OPERATORS = (
     set(COMPARISONS_TO_NATIVE)
@@ -1203,6 +1205,31 @@ class AsyncSereneDBVectorStore(VectorStore):
                         params,
                     )
                 return f"({field_selector} @@ ts_any({array}))", params
+
+            if operator == "$ngram":
+                text = filter_value
+                threshold = None
+                if isinstance(filter_value, dict):
+                    text = filter_value.get("text")
+                    threshold = filter_value.get("threshold")
+                if not isinstance(text, str) or not text:
+                    raise ValueError(
+                        "$ngram expects a string, or {'text': str, 'threshold': float}."
+                    )
+                tp = f"{field_param_prefix}_ngram_{suffix_id}"
+                fparams: dict[str, Any] = {tp: text}
+                if threshold is None:
+                    return f"({field_selector} @@ ts_ngram(%({tp})s))", fparams
+                if isinstance(threshold, bool) or not isinstance(
+                    threshold, (int, float)
+                ):
+                    raise ValueError("$ngram 'threshold' must be a number in [0, 1].")
+                thp = f"{field_param_prefix}_ngramthr_{suffix_id}"
+                fparams[thp] = float(threshold)
+                return (
+                    f"({field_selector} @@ ts_ngram(%({tp})s, %({thp})s))",
+                    fparams,
+                )
 
             fn = FTS_UNARY_FUNCTIONS[operator]
             param_name = f"{field_param_prefix}_{operator[1:]}_{suffix_id}"

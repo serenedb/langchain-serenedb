@@ -1345,3 +1345,59 @@ def test_fts_on_declared_json_text_field():
     finally:
         engine.drop_table(table)
         engine.close()
+
+
+def test_fts_ngram_on_dictionary_indexed_column():
+    """$ngram works on a metadata column indexed with an n-gram dictionary.
+
+    ts_ngram needs the column tokenized by an n-gram dictionary (with frequency AND
+    position); we can't enforce that from the client, so the user creates the dictionary
+    and indexes the column with it. Here we set that up explicitly.
+    """
+    table = f"lc_ngram_{uuid.uuid4().hex[:8]}"
+    dict_name = f"ng_dict_{uuid.uuid4().hex[:8]}"
+    engine = SereneDBEngine.from_connection_string(CONNINFO)
+    engine.init_vectorstore_table(
+        table, DIM, overwrite_existing=True, metadata_columns=[Column("title", "TEXT")]
+    )
+    engine._run_as_sync(
+        engine._aexecute(
+            f'CREATE TEXT SEARCH DICTIONARY "public"."{dict_name}" '
+            "(template = 'ngram', mingram = 2, maxgram = 3, "
+            "frequency = true, position = true)"
+        )
+    )
+    mi = MetadataIndexConfig(
+        columns=[MetadataColumnIndex("title", dictionary=dict_name)]
+    )
+    vs = SereneDBVectorStore.create_sync(
+        engine,
+        DetEmb(),
+        table,
+        metadata_columns=["title"],
+        distance_strategy=DistanceStrategy.COSINE_DISTANCE,
+        metadata_index=mi,
+    )
+    vs.add_texts(
+        ["a", "b", "c"],
+        metadatas=[{"title": "hello"}, {"title": "help"}, {"title": "world"}],
+    )
+    vs.apply_vector_index(IVFIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE))
+    try:
+        got = sorted(
+            d.metadata["title"]
+            for d in vs.similarity_search(
+                "x",
+                k=10,
+                filter={"title": {"$ngram": {"text": "hello", "threshold": 0.3}}},
+            )
+        )
+        assert "hello" in got
+    finally:
+        engine.drop_table(table)
+        engine._run_as_sync(
+            engine._aexecute(
+                f'DROP TEXT SEARCH DICTIONARY IF EXISTS "public"."{dict_name}"'
+            )
+        )
+        engine.close()
