@@ -1206,3 +1206,142 @@ def test_distance_named_metadata_column_hybrid():
     finally:
         engine.drop_table(table)
         engine.close()
+
+
+# -- full-text-search filter operators (@@ / ts_*) on indexed metadata columns ---------
+
+
+@pytest.fixture
+def fts_store():
+    """Store with an inverted-indexed ``category`` column for the @@/ts_* operators."""
+    table = f"lc_fts_{uuid.uuid4().hex[:8]}"
+    engine = SereneDBEngine.from_connection_string(CONNINFO)
+    engine.init_vectorstore_table(
+        table,
+        DIM,
+        overwrite_existing=True,
+        metadata_columns=[Column("category", "TEXT")],
+        vector_index=IVFIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE),
+    )
+    vs = SereneDBVectorStore.create_sync(
+        engine,
+        DetEmb(),
+        table,
+        metadata_columns=["category"],
+        distance_strategy=DistanceStrategy.COSINE_DISTANCE,
+    )
+    vs.add_texts(
+        ["a", "b", "c", "d", "e"],
+        metadatas=[
+            {"category": "sci-fi"},
+            {"category": "science"},
+            {"category": "drama"},
+            {"category": "comedy"},
+            {"category": "documentary"},
+        ],
+    )
+    try:
+        yield vs
+    finally:
+        engine.drop_table(table)
+        engine.close()
+
+
+def _fts_cats(vs, flt):
+    return sorted(
+        d.metadata["category"] for d in vs.similarity_search("x", k=10, filter=flt)
+    )
+
+
+def test_fts_startswith(fts_store):
+    assert _fts_cats(fts_store, {"category": {"$startswith": "sci"}}) == [
+        "sci-fi",
+        "science",
+    ]
+
+
+def test_fts_regex(fts_store):
+    assert _fts_cats(fts_store, {"category": {"$regex": "dram."}}) == ["drama"]
+
+
+def test_fts_fuzzy(fts_store):
+    assert _fts_cats(fts_store, {"category": {"$fuzzy": "scifi"}}) == ["sci-fi"]
+
+
+def test_fts_match_list(fts_store):
+    assert _fts_cats(fts_store, {"category": {"$match": ["drama", "comedy"]}}) == [
+        "comedy",
+        "drama",
+    ]
+
+
+def test_fts_match_min_match(fts_store):
+    # min_match = 1 is a plain OR over the tokens.
+    got = _fts_cats(
+        fts_store,
+        {"category": {"$match": {"tokens": ["drama", "comedy"], "min_match": 1}}},
+    )
+    assert got == ["comedy", "drama"]
+
+
+def test_fts_phrase(fts_store):
+    assert _fts_cats(fts_store, {"category": {"$phrase": "drama"}}) == ["drama"]
+
+
+def test_fts_operator_composes_with_logical(fts_store):
+    got = _fts_cats(
+        fts_store,
+        {
+            "$or": [
+                {"category": {"$startswith": "com"}},
+                {"category": {"$regex": "dram."}},
+            ]
+        },
+    )
+    assert got == ["comedy", "drama"]
+
+
+def test_fts_operator_rejects_non_indexed_field(fts_store):
+    # `note` is not an indexed metadata column (it lands in the JSON blob), so a
+    # full-text operator on it must raise rather than emit an invalid `@@`.
+    with pytest.raises(ValueError, match="inverted-indexed"):
+        fts_store.similarity_search("x", k=5, filter={"note": {"$startswith": "foo"}})
+
+
+def test_fts_on_declared_json_text_field():
+    """FTS operators also work on a declared TEXT JSON sub-field (indexed as (md->>'k'))."""
+    table = f"lc_ftsj_{uuid.uuid4().hex[:8]}"
+    engine = SereneDBEngine.from_connection_string(CONNINFO)
+    mi = MetadataIndexConfig(json_fields=[JsonFieldIndex("tag", "TEXT")])
+    engine.init_vectorstore_table(
+        table,
+        DIM,
+        overwrite_existing=True,
+        vector_index=IVFIndex(distance_strategy=DistanceStrategy.COSINE_DISTANCE),
+        metadata_index=mi,
+    )
+    vs = SereneDBVectorStore.create_sync(
+        engine,
+        DetEmb(),
+        table,
+        distance_strategy=DistanceStrategy.COSINE_DISTANCE,
+        metadata_index=mi,
+    )
+    vs.add_texts(
+        ["a", "b", "c"],
+        metadatas=[{"tag": "science"}, {"tag": "scifi"}, {"tag": "drama"}],
+    )
+    try:
+        got = sorted(
+            d.metadata["tag"]
+            for d in vs.similarity_search(
+                "x", k=10, filter={"tag": {"$startswith": "sci"}}
+            )
+        )
+        assert got == ["science", "scifi"]
+        # An undeclared JSON field (not indexed) is still rejected.
+        with pytest.raises(ValueError, match="inverted-indexed"):
+            vs.similarity_search("x", k=5, filter={"other": {"$regex": "x.*"}})
+    finally:
+        engine.drop_table(table)
+        engine.close()

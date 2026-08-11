@@ -58,11 +58,26 @@ COMPARISONS_TO_NATIVE = {
 SPECIAL_CASED_OPERATORS = {"$in", "$nin", "$between", "$exists"}
 TEXT_OPERATORS = {"$like", "$ilike"}
 LOGICAL_OPERATORS = {"$and", "$or", "$not"}
+
+# Full-text-search operators. Each translates to ``column @@ ts_*(...)`` — the inverted
+# index match. SereneDB evaluates ``@@`` only against an inverted-indexed column, so the
+# filter translator gates these to indexed metadata columns (raising a clear error
+# otherwise) rather than letting the DB reject them cryptically. Unlike the plain
+# operators above, they have no residual/exact-scan fallback.
+FTS_UNARY_FUNCTIONS = {
+    "$startswith": "ts_starts_with",  # prefix match
+    "$regex": "ts_regexp",  # regular-expression match against indexed terms
+    "$phrase": "ts_phrase",  # ordered-adjacent phrase match
+    "$fuzzy": "ts_levenshtein",  # typo-tolerant match (auto edit distance)
+}
+FTS_OPERATORS = set(FTS_UNARY_FUNCTIONS) | {"$match"}  # $match -> ts_any (OR / N-of-M)
+
 SUPPORTED_OPERATORS = (
     set(COMPARISONS_TO_NATIVE)
     | TEXT_OPERATORS
     | SPECIAL_CASED_OPERATORS
     | set(LOGICAL_OPERATORS)
+    | FTS_OPERATORS
 )
 
 # SereneDB scalar types used when casting a JSON-extracted value for comparison.
@@ -991,6 +1006,31 @@ class AsyncSereneDBVectorStore(VectorStore):
                 return json_field
         return None
 
+    def _is_fts_filterable(self, field: str, field_column: str) -> bool:
+        """Whether ``field`` is something this store's inverted index covers as a text term.
+
+        Full-text operators (``$startswith``/``$regex``/``$fuzzy``/``$match``/``$phrase``)
+        compile to ``<expr> @@ ts_*(...)``, which SereneDB evaluates only against an
+        inverted-indexed text term. That is either:
+
+        - an indexed metadata column — the default (``metadata_index`` None or ``columns``
+          None) indexes every metadata column; an explicit ``columns`` list narrows it; or
+        - a declared JSON sub-field of ``TEXT`` type (indexed as a bare ``(md ->> 'k')``
+          term). Non-``TEXT`` declared fields carry a ``::TYPE`` cast, so they are not a
+          text term and cannot be FTS-matched.
+
+        Un-indexed columns and undeclared JSON fields are not FTS-filterable.
+        """
+        declared = self._declared_json_field(field)
+        if declared is not None:
+            return declared.data_type.strip().upper() == "TEXT"
+        if field_column not in self.metadata_columns:
+            return False
+        mi = self.metadata_index
+        if mi is None or mi.columns is None:
+            return True
+        return any(col.name == field_column for col in mi.columns)
+
     def _handle_field_filter(self, *, field: str, value: Any) -> tuple[str, dict]:
         """Translate a single field filter to a SereneDB WHERE clause fragment."""
         if not isinstance(field, str):
@@ -1125,6 +1165,50 @@ class AsyncSereneDBVectorStore(VectorStore):
                 )
             null_test = "IS NOT NULL" if filter_value else "IS NULL"
             return f"({field_selector} {null_test})", {}
+
+        if operator in FTS_OPERATORS:
+            if not self._is_fts_filterable(field, field_column):
+                raise ValueError(
+                    f"Operator {operator} requires '{field}' to be an inverted-indexed "
+                    "metadata column or a TEXT JSON field declared in "
+                    "metadata_index.json_fields: full-text operators use the `@@` match, "
+                    "which SereneDB evaluates only against an indexed text term. Add it to "
+                    "the store's metadata index (or drop the operator)."
+                )
+            if operator == "$match":
+                tokens = filter_value
+                min_match = None
+                if isinstance(filter_value, dict):
+                    tokens = filter_value.get("tokens")
+                    min_match = filter_value.get("min_match")
+                if not isinstance(tokens, (list, tuple)) or not tokens:
+                    raise ValueError(
+                        "$match expects a non-empty list of tokens, or "
+                        "{'tokens': [...], 'min_match': N}."
+                    )
+                params = {}
+                placeholders = []
+                for i, tok in enumerate(tokens):
+                    pname = f"{field_param_prefix}_match_{i}_{suffix_id}"
+                    placeholders.append(f"%({pname})s")
+                    params[pname] = tok
+                array = f"ARRAY[{', '.join(placeholders)}]"
+                if min_match is not None:
+                    # ts_any requires min_match as an INTEGER literal (not a bind param);
+                    # validate it is an int so inlining it is injection-safe.
+                    if isinstance(min_match, bool) or not isinstance(min_match, int):
+                        raise ValueError("$match 'min_match' must be an integer.")
+                    return (
+                        f"({field_selector} @@ ts_any({array}, {min_match}))",
+                        params,
+                    )
+                return f"({field_selector} @@ ts_any({array}))", params
+
+            fn = FTS_UNARY_FUNCTIONS[operator]
+            param_name = f"{field_param_prefix}_{operator[1:]}_{suffix_id}"
+            return f"({field_selector} @@ {fn}(%({param_name})s))", {
+                param_name: filter_value
+            }
 
         raise NotImplementedError()
 

@@ -74,7 +74,7 @@ class HybridSearchConfig:
     secondary_top_k: int = 4
     dictionary_name: str = "langchain_fts_dict"
     dictionary_options: str = (
-        "template = 'text', locale = 'en_US.UTF-8', "
+        "template = 'segmentation', case = 'lower', "
         "frequency = true, position = true, norm = true"
     )
     scorer: str = "BM25"
