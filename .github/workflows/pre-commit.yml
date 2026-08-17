@@ -1,0 +1,31 @@
+name: auto | pre-commit
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Supersede an in-flight run when the same ref gets new commits, so rapid pushes to a PR
+# don't stack up concurrent runs on stale commits.
+concurrency:
+  group: pre-commit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          submodules: false
+          clean: false
+      - uses: actions/setup-python@v6
+      # The mypy hook is a *local* hook that runs `uv run --extra test mypy` so it can
+      # resolve the project's own dependencies (see .pre-commit-config.yaml). That needs
+      # uv on PATH -- the hosted runner has none, so install it before pre-commit runs.
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      # No floating v3 tag -- only specific versions published.
+      - uses: pre-commit/action@v3.0.1

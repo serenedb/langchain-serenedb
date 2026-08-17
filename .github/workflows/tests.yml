@@ -1,0 +1,40 @@
+name: auto | integration tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      serenedb_image:
+        description: "SereneDB image to test against"
+        type: string
+        default: "serenedb/serenedb:latest"
+
+# Supersede an in-flight run when the same ref gets new commits, so rapid pushes to a PR
+# don't stack up concurrent runs on stale commits.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+# On pull_request / push there is no input, so fall back to the default tag. Trigger the
+# workflow manually ("Run workflow" in the Actions tab) to test against a different image
+env:
+  SERENEDB_IMAGE: ${{ inputs.serenedb_image || 'serenedb/serenedb:latest' }}
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          submodules: false
+          clean: false
+      # Brings up the SereneDB instance and a test-runner container from
+      # tests/docker-compose.yml and runs the suite against it. --exit-code-from makes the
+      # whole `up` exit with pytest's status, so the job fails iff the suite fails.
+      - name: Run integration suite against ${{ env.SERENEDB_IMAGE }}
+        run: |
+          docker compose -f tests/docker-compose.yml up \
+            --abort-on-container-exit --exit-code-from tests
