@@ -25,7 +25,7 @@ jobs:
             github.event.action == 'opened' ||
             (github.event.action == 'labeled' && github.event.label.name == 'spawn-build-bot')
           )
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const body = [
@@ -61,7 +61,7 @@ jobs:
           github.event.comment.user.login == 'github-actions[bot]' &&
           contains(github.event.comment.body, '<!-- langchain-serenedb-ci-trigger -->') &&
           contains(github.event.comment.body, '- [x] **Trigger Jobs**')
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const { data: pr } = await github.rest.pulls.get({
@@ -81,7 +81,7 @@ jobs:
           PR_SHA: ${{ steps.pr-info.outputs.sha }}
           BASE_REF: ${{ steps.pr-info.outputs.base_ref }}
           IS_FORK: ${{ steps.pr-info.outputs.is_fork }}
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         with:
           script: |
             const comment = context.payload.comment;

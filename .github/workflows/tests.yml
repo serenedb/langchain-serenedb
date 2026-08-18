@@ -45,7 +45,7 @@ jobs:
             --abort-on-container-exit --exit-code-from tests
       - name: Report result to PR
         if: always() && inputs.PR_SHA != ''
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9
         env:
           PR_SHA: ${{ inputs.PR_SHA }}
           JOB_STATUS: ${{ job.status }}
