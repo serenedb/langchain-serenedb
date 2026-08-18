@@ -1,0 +1,172 @@
+name: auto | pr trigger
+
+on:
+  pull_request_target:
+    types: [opened, labeled]
+  issue_comment:
+    types: [edited]
+
+concurrency:
+  group: pr-build-trigger-${{ github.event.issue.number || github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  handle:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: write
+      statuses: write
+    steps:
+      - name: Post CI trigger comment
+        if: >-
+          github.event_name == 'pull_request_target' && (
+            github.event.action == 'opened' ||
+            (github.event.action == 'labeled' && github.event.label.name == 'spawn-build-bot')
+          )
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const body = [
+              '<!-- langchain-serenedb-ci-trigger -->',
+              '### CI Triggers',
+              '_Check **Trigger Jobs** to run the integration suite against this PR._',
+              '',
+              '- [ ] **Trigger Jobs**',
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body,
+            });
+
+            // The label is a one-shot "re-post the comment" signal; remove it after use.
+            if (context.payload.action === 'labeled') {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                name: 'spawn-build-bot',
+              }).catch(() => {});
+            }
+
+      - name: Get PR info
+        id: pr-info
+        if: >-
+          github.event_name == 'issue_comment' &&
+          github.event.issue.pull_request &&
+          github.event.comment.user.login == 'github-actions[bot]' &&
+          contains(github.event.comment.body, '<!-- langchain-serenedb-ci-trigger -->') &&
+          contains(github.event.comment.body, '- [x] **Trigger Jobs**')
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.issue.number,
+            });
+            core.setOutput('branch', pr.head.ref);
+            core.setOutput('sha', pr.head.sha);
+            core.setOutput('base_ref', pr.base.ref);
+            core.setOutput('is_fork', (pr.head.repo.full_name !== pr.base.repo.full_name).toString());
+
+      - name: Trigger integration tests
+        if: steps.pr-info.conclusion == 'success'
+        env:
+          PR_BRANCH: ${{ steps.pr-info.outputs.branch }}
+          PR_SHA: ${{ steps.pr-info.outputs.sha }}
+          BASE_REF: ${{ steps.pr-info.outputs.base_ref }}
+          IS_FORK: ${{ steps.pr-info.outputs.is_fork }}
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const comment = context.payload.comment;
+            const body = comment.body || '';
+            const branch = process.env.PR_BRANCH;
+            const sha = process.env.PR_SHA;
+            const baseRef = process.env.BASE_REF;
+            const isFork = process.env.IS_FORK === 'true';
+            // A fork branch does not exist in this repo, so a fork PR must dispatch on the
+            // base ref; tests.yml still checks out the PR head SHA passed below.
+            const dispatchRef = isFork ? baseRef : branch;
+
+            const { owner, repo } = context.repo;
+            const workflowId = 'tests.yml';
+            const statusContext = 'langchain-serenedb | integration tests';
+
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha, state: 'pending',
+              description: 'Integration tests queued',
+              context: statusContext,
+            });
+
+            // Snapshot the latest run id before dispatch so we can find the new one.
+            const { data: before } = await github.rest.actions.listWorkflowRuns({
+              owner, repo, workflow_id: workflowId, branch: dispatchRef, per_page: 1,
+            });
+            const prevId = before.workflow_runs[0]?.id || 0;
+
+            await github.rest.actions.createWorkflowDispatch({
+              owner, repo,
+              workflow_id: workflowId,
+              ref: dispatchRef,
+              inputs: {
+                serenedb_image: 'serenedb/serenedb:latest',
+                PR_SHA: sha,
+                PR_NUMBER: String(context.payload.issue.number),
+              },
+            });
+
+            // Wait for the new run to appear (up to 30s) so we can link it.
+            let runUrl = `${context.serverUrl}/${owner}/${repo}/actions/workflows/${workflowId}`;
+            for (let i = 0; i < 6; i++) {
+              await new Promise(r => setTimeout(r, 5000));
+              const { data: after } = await github.rest.actions.listWorkflowRuns({
+                owner, repo, workflow_id: workflowId, branch: dispatchRef, per_page: 5,
+              });
+              const run = after.workflow_runs.find(r => r.id > prevId);
+              if (run) { runUrl = run.html_url; break; }
+            }
+
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha, state: 'pending',
+              description: 'Integration tests running',
+              context: statusContext,
+              target_url: runUrl,
+            });
+
+            // Uncheck "Trigger Jobs" and record the run in a hidden history blob so the
+            // comment shows the latest run plus a collapsible list of previous ones.
+            const timestamp = new Date().toISOString().replace('T', ' ').substring(0, 19) + ' UTC';
+            let updatedBody = body.replace('- [x] **Trigger Jobs**', '- [ ] **Trigger Jobs**');
+
+            const dataRe = /<!-- ci-data:(.*?) -->/;
+            const dataMatch = updatedBody.match(dataRe);
+            const history = dataMatch ? JSON.parse(dataMatch[1]) : [];
+            history.push({ url: runUrl, time: timestamp });
+
+            const latest = history[history.length - 1];
+            let resultsBlock = `\n\n**Latest:** [View Run](${latest.url}) · ${latest.time}`;
+            if (history.length > 1) {
+              const oldRuns = history.slice(0, -1).reverse().map(r => `| [View Run](${r.url}) | ${r.time} |`);
+              resultsBlock += [
+                '', '',
+                '<details><summary>Previous runs</summary>',
+                '', '| Link | Time |', '|------|------|',
+                ...oldRuns, '', '</details>',
+              ].join('\n');
+            }
+
+            const sectionRe = /\n\n<!-- ci-data:.*? -->[\s\S]*$/;
+            const newData = `\n\n<!-- ci-data:${JSON.stringify(history)} -->${resultsBlock}`;
+            updatedBody = sectionRe.test(updatedBody)
+              ? updatedBody.replace(sectionRe, newData)
+              : updatedBody + newData;
+
+            await github.rest.issues.updateComment({
+              owner, repo, comment_id: comment.id, body: updatedBody,
+            });

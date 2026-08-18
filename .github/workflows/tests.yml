@@ -1,9 +1,6 @@
-name: auto | integration tests
+name: manual | integration tests
 
 on:
-  pull_request:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       serenedb_image:
@@ -11,30 +8,56 @@ on:
         type: string
         default: "serenedb/serenedb:latest"
 
-# Supersede an in-flight run when the same ref gets new commits, so rapid pushes to a PR
-# don't stack up concurrent runs on stale commits.
+      PR_SHA:
+        description: "PR head SHA to check out and report status on (optional)"
+        type: string
+        default: ""
+      PR_NUMBER:
+        description: "PR number, used to scope concurrency (optional)"
+        type: string
+        default: ""
+
 concurrency:
-  group: tests-${{ github.ref }}
+  group: tests-${{ inputs.PR_NUMBER || github.ref }}
   cancel-in-progress: true
 
-# On pull_request / push there is no input, so fall back to the default tag. Trigger the
-# workflow manually ("Run workflow" in the Actions tab) to test against a different image
 env:
   SERENEDB_IMAGE: ${{ inputs.serenedb_image || 'serenedb/serenedb:latest' }}
 
 jobs:
   integration:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write   # so a PR-triggered run can post its result as a commit status
     steps:
       - uses: actions/checkout@v7
         with:
+          # When dispatched by pr-build-trigger.yml, PR_SHA is the PR head commit (which
+          # may live on a fork); a plain manual run checks out the dispatched ref.
+          ref: ${{ inputs.PR_SHA || github.ref }}
           fetch-depth: 1
           submodules: false
           clean: false
-      # Brings up the SereneDB instance and a test-runner container from
-      # tests/docker-compose.yml and runs the suite against it. --exit-code-from makes the
-      # whole `up` exit with pytest's status, so the job fails iff the suite fails.
       - name: Run integration suite against ${{ env.SERENEDB_IMAGE }}
         run: |
           docker compose -f tests/docker-compose.yml up \
             --abort-on-container-exit --exit-code-from tests
+      - name: Report result to PR
+        if: always() && inputs.PR_SHA != ''
+        uses: actions/github-script@v8
+        env:
+          PR_SHA: ${{ inputs.PR_SHA }}
+          JOB_STATUS: ${{ job.status }}
+        with:
+          script: |
+            const state = process.env.JOB_STATUS === 'success' ? 'success' : 'failure';
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: process.env.PR_SHA,
+              state,
+              context: 'langchain-serenedb | integration tests',
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              description: state === 'success' ? 'Integration tests passed' : 'Integration tests failed',
+            });
