@@ -39,39 +39,20 @@ services:
     #   - "7890:7890"
 
   tests:
-    # Reuse the SereneDB build image: CI agents keep it cached and it already carries
-    # almost all test dependencies, so there is no per-run image build. The command tops
-    # up anything missing from requirements.txt, then runs the suite.
     image: ${BUILD_IMAGE:-serenedb/serenedb-build-ubuntu:latest}
     depends_on:
       - serened
     working_dir: /app
     volumes:
-      # Mount the checked-out repo (in CI, the job's workspace). `..` is the repo root
-      # relative to this file. The suite imports langchain_serenedb straight from here:
-      # run.sh runs `python -m pytest` from /app, so the package needs no install.
       - ..:/app
     environment:
-      # Point run.sh at the serened service. It polls until the DB is ready (up to
-      # SERENEDB_WAIT_TIMEOUT seconds), covering the time the image needs to boot.
       SERENEDB_HOST: serened
       SERENEDB_PORT: "7890"
-      # Must match the serened service's POSTGRES_PASSWORD above; run.sh folds this into
-      # the conninfo it builds (and passes to pytest) as `password=...`.
       SERENEDB_PASSWORD: ${SERENEDB_PASSWORD:-postgres}
       SERENEDB_WAIT_TIMEOUT: "60"
-      # Force the image's interpreter; otherwise run.sh would prefer a .venv/bin/python
-      # from the mounted repo, which is built for the host.
       PYTHON: python3
-      # Permit installing into an externally-managed (PEP 668) system Python; ignored
-      # where it does not apply.
       PIP_BREAK_SYSTEM_PACKAGES: "1"
-      # Extra pytest args, if any -- pytest reads PYTEST_ADDOPTS natively, e.g.:
-      #   PYTEST_ADDOPTS="-k hybrid -q" docker compose -f tests/docker-compose.yml run --rm tests
       PYTEST_ADDOPTS: ${PYTEST_ADDOPTS:-}
-    # The build image has no custom entrypoint (its default CMD is `bash`), so we do not
-    # override the entrypoint -- just install any missing deps into the image's python3
-    # here, then exec the suite.
     command:
       - bash
       - -c
