@@ -20,7 +20,7 @@ jobs:
           fetch-depth: 1
           submodules: false
           clean: false
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
       # The mypy hook is a *local* hook that runs `uv run --extra test mypy` so it can
       # resolve the project's own dependencies (see .pre-commit-config.yaml). That needs
       # uv on PATH -- the hosted runner has none, so install it before pre-commit runs.
