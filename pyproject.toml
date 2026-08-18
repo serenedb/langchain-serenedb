@@ -1,11 +1,32 @@
 [project]
 name = "langchain-serenedb"
-version = "0.0.2"
+dynamic = ["version"]
 description = "An integration package connecting SereneDB and LangChain"
-authors = []
+authors = [{ name = "SereneDB" }]
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
+keywords = [
+    "langchain",
+    "serenedb",
+    "vectorstore",
+    "vector-database",
+    "embeddings",
+    "rag",
+    "postgres",
+    "psycopg",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "langchain-core>=1.2.11,<2.0",
     "psycopg[binary]>=3,<4",
@@ -14,7 +35,9 @@ dependencies = [
 ]
 
 [project.urls]
-"Source Code" = "https://github.com/serenedb/langchain-serenedb"
+Homepage = "https://github.com/serenedb/langchain-serenedb"
+Repository = "https://github.com/serenedb/langchain-serenedb"
+Documentation = "https://docs.serenedb.com"
 
 [project.optional-dependencies]
 test = [
@@ -29,8 +52,14 @@ test = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+# Version is derived from the git tag (e.g. tag v0.1.0 -> version 0.1.0). Untagged
+# builds get a dev version like 0.1.0.dev3+g<sha>; publish only from a tag (see
+# .github/workflows/publish.yml).
+[tool.hatch.version]
+source = "vcs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["langchain_serenedb"]

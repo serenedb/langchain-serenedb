@@ -1,0 +1,72 @@
+name: manual | publish to testpypi
+
+run-name: "test-publish '${{ inputs.release_title }}' to TestPyPI"
+
+# Verification helper. Fetches the artifacts attached to a GitHub Release -- looked up by
+# its TITLE, so DRAFT releases work too (a draft has no git tag yet) -- and uploads them
+# to TestPyPI. Lets you rehearse the real release flow (prepare-release.yml -> publish.yml)
+# end to end without touching real PyPI and without publishing the draft. TestPyPI is a
+# throwaway index, so this is safe to run repeatedly.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_title:
+        description: "Title of the (draft or published) release to test-publish, e.g. v0.1.0"
+        type: string
+        required: true
+
+concurrency:
+  group: publish-testpypi-${{ inputs.release_title }}
+  cancel-in-progress: false
+
+jobs:
+  test-publish:
+    runs-on: ubuntu-latest
+    # Configure a Trusted Publisher on test.pypi.org for this workflow + environment.
+    environment: testpypi
+    permissions:
+      id-token: write # OIDC for TestPyPI Trusted Publishing
+      contents: write # needed to READ draft-release assets (drafts are visible only to
+      # push-level tokens); nothing is written to the repo
+    steps:
+      - name: Fetch release artifacts by title
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TITLE: ${{ inputs.release_title }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # Find the release (drafts included) whose name matches the title; newest wins.
+          RELEASE_ID=$(gh api "repos/${GH_REPO}/releases" --paginate \
+            --jq '[.[] | select(.name == env.TITLE)] | sort_by(.created_at) | last | .id // empty')
+          if [[ -z "$RELEASE_ID" ]]; then
+            echo "::error::No release found with title '$TITLE' (drafts included)."; exit 1
+          fi
+          echo "Matched release id $RELEASE_ID"
+          # Download each langchain-serenedb asset by id. This works for drafts, unlike a
+          # tag-based `gh release download` (a draft's git tag does not exist yet).
+          gh api "repos/${GH_REPO}/releases/${RELEASE_ID}/assets" --paginate \
+            --jq '.[] | select(.name | startswith("langchain_serenedb-")) | "\(.id)\t\(.name)"' \
+          | while IFS=$'\t' read -r ID NAME; do
+              echo "Downloading $NAME (asset $ID)"
+              gh api "repos/${GH_REPO}/releases/assets/${ID}" \
+                -H "Accept: application/octet-stream" > "dist/${NAME}"
+            done
+          echo "Fetched:"; ls -l dist/
+          if ! ls dist/*.whl >/dev/null 2>&1; then
+            echo "::error::No wheel asset found on release '$TITLE'."; exit 1
+          fi
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Validate artifacts
+        run: uvx twine check dist/*
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          # TestPyPI also rejects duplicate versions; skip them so re-runs of this
+          # verification workflow don't hard-fail on an already-uploaded version.
+          skip-existing: true

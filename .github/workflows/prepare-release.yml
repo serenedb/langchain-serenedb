@@ -1,0 +1,202 @@
+name: manual | prepare release
+
+run-name: "prepare release ${{ inputs.version != '' && inputs.version || '(auto)' }}"
+
+# Step 1 of 2 of the release process (manual, no push trigger). Resolves a version,
+# builds the wheel + sdist with it injected, tests the built WHEEL, and creates a DRAFT
+# GitHub Release with the artifacts attached. It does NOT create the git tag and does NOT
+# touch PyPI.
+#
+# A maintainer then reviews the draft and publishes it -- publishing creates the git tag
+# and fires publish.yml (step 2), which uploads these exact, already-tested artifacts to
+# PyPI. Because nothing irreversible happens here, a failed run costs nothing: fix the
+# code and re-run (no tag was created, and the leftover draft is replaced).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, e.g. 0.1.0 (leave empty to auto-increment the patch)"
+        type: string
+        default: ""
+      serenedb_image:
+        description: "SereneDB image to test the wheel against"
+        type: string
+        default: "serenedb/serenedb:latest"
+
+concurrency:
+  group: prepare-release
+  cancel-in-progress: false
+
+env:
+  SERENEDB_IMAGE: ${{ inputs.serenedb_image || 'serenedb/serenedb:latest' }}
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - name: Resolve release version
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$INPUT_VERSION" ]]; then
+            VERSION="${INPUT_VERSION#v}"
+            if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+              echo "::error::'$INPUT_VERSION' is not a valid version (expected e.g. 0.1.0)"; exit 1
+            fi
+          else
+            # Auto-increment the patch of the highest vX.Y.Z release (draft or published).
+            LATEST=$(gh release list --limit 100 --json tagName \
+              --jq '[.[].tagName | ltrimstr("v") | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))]
+                    | sort_by(split(".") | map(tonumber)) | last // empty')
+            if [[ -z "$LATEST" ]]; then
+              VERSION="0.1.0"
+            else
+              IFS=. read -r MAJ MIN PAT <<<"$LATEST"
+              VERSION="${MAJ}.${MIN}.$((PAT + 1))"
+            fi
+          fi
+          # Fail fast if this version is already PUBLISHED (a leftover draft is fine --
+          # the release job replaces it). Prevents a wasted build + test.
+          STATE=$(gh release view "v${VERSION}" --json isDraft --jq '.isDraft' 2>/dev/null || echo missing)
+          if [[ "$STATE" == "false" ]]; then
+            echo "::error::Release v${VERSION} is already published; bump the version."; exit 1
+          fi
+          echo "Resolved version: ${VERSION} (existing release: ${STATE})"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve-version
+    runs-on: ubuntu-latest
+    env:
+      # No tag exists yet (it is created only when the draft release is published), so
+      # inject the resolved version rather than deriving it from git.
+      SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.resolve-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Build wheel + sdist
+        run: uv build
+      - name: Verify built version
+        env:
+          EXPECTED: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          VERSION="$(ls dist/*.whl | sed -E 's|.*/langchain_serenedb-(.+)-py3-none-any\.whl|\1|')"
+          echo "Built version: $VERSION (expected $EXPECTED)"
+          if [[ "$VERSION" != "$EXPECTED" ]]; then
+            echo "::error::Built version '$VERSION' != resolved '$EXPECTED'"; exit 1
+          fi
+      - name: Validate package metadata
+        run: uvx twine check dist/*
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  test-wheel:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+      - uses: actions/download-artifact@v7
+        with:
+          name: dist
+          path: dist/
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Start SereneDB
+        run: |
+          docker run -d --name serened -p 7890:7890 \
+            -e POSTGRES_PASSWORD=postgres "$SERENEDB_IMAGE"
+      - name: Install the built wheel into a fresh venv
+        run: |
+          uv venv
+          # Test the artifact, not the source tree: remove the package dir so imports
+          # resolve to the installed wheel, then install the wheel + the test deps.
+          # (uv does not pull a wheel's [test] extra from a file path, so list them.)
+          rm -rf langchain_serenedb
+          WHEEL="$(ls dist/*.whl)"
+          uv pip install --python .venv/bin/python "$WHEEL" \
+            pytest pytest-asyncio pytest-timeout pytest-mock langchain-tests
+      - name: Run integration suite against the wheel
+        env:
+          PYTHON: ${{ github.workspace }}/.venv/bin/python
+          SERENEDB_HOST: "127.0.0.1"
+          SERENEDB_PORT: "7890"
+          SERENEDB_PASSWORD: postgres
+          SERENEDB_WAIT_TIMEOUT: "90"
+        run: tests/run.sh -- tests/integration_tests -q
+      - name: SereneDB logs (on failure)
+        if: failure()
+        run: docker logs serened || true
+
+  draft-release:
+    needs: [resolve-version, test-wheel]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the draft release and upload the built artifacts
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.resolve-version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: dist
+          path: dist/
+      - name: Create draft GitHub Release
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+          # Replace a leftover draft from an earlier failed run; refuse a published one.
+          STATE=$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null || echo missing)
+          if [[ "$STATE" == "true" ]]; then
+            echo "Replacing existing draft $TAG"
+            gh release delete "$TAG" --yes
+            gh api -X DELETE "repos/${GH_REPO}/git/refs/tags/${TAG}" 2>/dev/null || true
+          elif [[ "$STATE" == "false" ]]; then
+            echo "::error::Release $TAG already published; refusing to overwrite"; exit 1
+          fi
+          # Gather release notes: GitHub's auto-generated "What's Changed" (merged PRs
+          # since the last release) computed up to this commit, with a pip-install header
+          # prepended -- the langchain-serenedb analog of the reference's install-body.
+          GENERATED=$(gh api -X POST "repos/${GH_REPO}/releases/generate-notes" \
+            -f tag_name="$TAG" -f target_commitish="${{ github.sha }}" --jq '.body' 2>/dev/null || true)
+          {
+            echo "## langchain-serenedb ${VERSION}"
+            echo
+            echo '```bash'
+            echo "pip install langchain-serenedb==${VERSION}"
+            echo '```'
+            echo
+            echo "- [PyPI](https://pypi.org/project/langchain-serenedb/${VERSION}/)"
+            echo "- [Documentation](https://docs.serenedb.com)"
+            if [[ -n "${GENERATED:-}" ]]; then
+              echo
+              echo "${GENERATED}"
+            fi
+          } > release-notes.md
+
+          # A DRAFT release does not create the git tag yet -- the tag $TAG is created only
+          # when a human publishes this draft (which then fires publish.yml). --target pins
+          # the eventual tag to this commit.
+          gh release create "$TAG" dist/* \
+            --draft \
+            --target "${{ github.sha }}" \
+            --title "$TAG" \
+            --notes-file release-notes.md
+          echo "Draft $TAG created. Review its notes, then publish it to release to PyPI."
