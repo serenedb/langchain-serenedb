@@ -2,11 +2,17 @@ name: manual | publish to testpypi
 
 run-name: "test-publish '${{ inputs.release_title }}' to TestPyPI"
 
-# Verification helper. Fetches the artifacts attached to a GitHub Release -- looked up by
-# its TITLE, so DRAFT releases work too (a draft has no git tag yet) -- and uploads them
-# to TestPyPI. Lets you rehearse the real release flow (prepare-release.yml -> publish.yml)
-# end to end without touching real PyPI and without publishing the draft. TestPyPI is a
-# throwaway index, so this is safe to run repeatedly.
+# Verification helper. Targets a GitHub Release looked up by its TITLE (so DRAFT releases
+# work too -- a draft has no git tag yet) and uploads to TestPyPI, letting you rehearse
+# the real release flow without touching real PyPI or publishing the draft.
+#
+# Two modes, chosen by `version_suffix`:
+#   - empty   -> FETCH the artifacts attached to the release and publish them as-is
+#                (tests the exact bytes that would ship to real PyPI).
+#   - set     -> REBUILD from the release's commit as <base><suffix> (e.g. 0.1.0a2) and
+#                publish that. Use this to re-verify after fixing something: TestPyPI (like
+#                PyPI) rejects a duplicate version, and the version is baked into the wheel,
+#                so a fresh TestPyPI upload needs a fresh version -- the suffix supplies it.
 
 on:
   workflow_dispatch:
@@ -15,6 +21,10 @@ on:
         description: "Title of the (draft or published) release to test-publish, e.g. v0.1.0"
         type: string
         required: true
+      version_suffix:
+        description: "Optional PEP 440 suffix for a fresh TestPyPI version, e.g. a2, b1, rc1, .dev2 (rebuilds from the release commit). Empty = publish the attached artifacts as-is."
+        type: string
+        default: ""
 
 concurrency:
   group: publish-testpypi-${{ inputs.release_title }}
@@ -28,25 +38,57 @@ jobs:
     permissions:
       id-token: write # OIDC for TestPyPI Trusted Publishing
       contents: write # needed to READ draft-release assets (drafts are visible only to
-      # push-level tokens); nothing is written to the repo
+      # push-level tokens) and to check out the release commit; nothing is written
     steps:
-      - name: Fetch release artifacts by title
+      - name: Resolve release
+        id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TITLE: ${{ inputs.release_title }}
+          SUFFIX: ${{ inputs.version_suffix }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$SUFFIX" && "$SUFFIX" == *"+"* ]]; then
+            echo "::error::Local version segments (+...) are rejected by TestPyPI; use a pre/dev/post suffix like a2, rc1, .dev2."; exit 1
+          fi
+          # Find the release (drafts included) whose name matches the title; newest wins.
+          REL=$(gh api "repos/${GH_REPO}/releases" --paginate \
+            --jq '[.[] | select(.name == env.TITLE)] | sort_by(.created_at) | last // empty')
+          if [[ -z "$REL" || "$REL" == "null" ]]; then
+            echo "::error::No release found with title '$TITLE' (drafts included)."; exit 1
+          fi
+          RELEASE_ID=$(jq -r '.id' <<<"$REL")
+          TAG_NAME=$(jq -r '.tag_name' <<<"$REL")
+          TARGET=$(jq -r '.target_commitish' <<<"$REL")
+          BASE="${TAG_NAME#v}"
+          echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          if [[ -n "$SUFFIX" ]]; then
+            echo "mode=rebuild" >> "$GITHUB_OUTPUT"
+            echo "version=${BASE}${SUFFIX}" >> "$GITHUB_OUTPUT"
+            echo "Mode: REBUILD ${BASE}${SUFFIX} from ${TARGET} (release '$TITLE')"
+          else
+            echo "mode=fetch" >> "$GITHUB_OUTPUT"
+            echo "Mode: FETCH attached artifacts from release id $RELEASE_ID (release '$TITLE')"
+          fi
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # --- fetch mode: publish the exact artifacts attached to the release ---
+      - name: Fetch attached artifacts
+        if: steps.resolve.outputs.mode == 'fetch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_ID: ${{ steps.resolve.outputs.release_id }}
+          TITLE: ${{ inputs.release_title }}
         run: |
           set -euo pipefail
           mkdir -p dist
-          # Find the release (drafts included) whose name matches the title; newest wins.
-          RELEASE_ID=$(gh api "repos/${GH_REPO}/releases" --paginate \
-            --jq '[.[] | select(.name == env.TITLE)] | sort_by(.created_at) | last | .id // empty')
-          if [[ -z "$RELEASE_ID" ]]; then
-            echo "::error::No release found with title '$TITLE' (drafts included)."; exit 1
-          fi
-          echo "Matched release id $RELEASE_ID"
-          # Download each langchain-serenedb asset by id. This works for drafts, unlike a
-          # tag-based `gh release download` (a draft's git tag does not exist yet).
+          # Download each asset by id -- works for drafts, unlike a tag-based download.
           gh api "repos/${GH_REPO}/releases/${RELEASE_ID}/assets" --paginate \
             --jq '.[] | select(.name | startswith("langchain_serenedb-")) | "\(.id)\t\(.name)"' \
           | while IFS=$'\t' read -r ID NAME; do
@@ -54,19 +96,31 @@ jobs:
               gh api "repos/${GH_REPO}/releases/assets/${ID}" \
                 -H "Accept: application/octet-stream" > "dist/${NAME}"
             done
-          echo "Fetched:"; ls -l dist/
           if ! ls dist/*.whl >/dev/null 2>&1; then
             echo "::error::No wheel asset found on release '$TITLE'."; exit 1
           fi
-      - uses: astral-sh/setup-uv@v6
+          echo "Fetched:"; ls -l dist/
+
+      # --- rebuild mode: build a fresh, suffixed version from the release's commit ---
+      - name: Check out the release commit
+        if: steps.resolve.outputs.mode == 'rebuild'
+        uses: actions/checkout@v7
         with:
-          enable-cache: true
+          ref: ${{ steps.resolve.outputs.target }}
+          fetch-depth: 1
+      - name: Rebuild with the suffixed version
+        if: steps.resolve.outputs.mode == 'rebuild'
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          uv build
+          echo "Rebuilt:"; ls -l dist/
+
+      # --- shared tail ---
       - name: Validate artifacts
         run: uvx twine check dist/*
       - name: Publish to TestPyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           repository-url: https://test.pypi.org/legacy/
-          # TestPyPI also rejects duplicate versions; skip them so re-runs of this
-          # verification workflow don't hard-fail on an already-uploaded version.
-          skip-existing: true
