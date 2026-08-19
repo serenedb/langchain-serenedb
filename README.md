@@ -20,8 +20,7 @@ It maps the integration onto SereneDB's native capabilities:
 pip install langchain-serenedb
 ```
 
-Requires Python 3.10+. Not yet published to PyPI — until the first release, install from
-a checkout (`pip install -e .`; see [CONTRIBUTING.md](CONTRIBUTING.md)).
+Requires Python 3.10+.
 
 ## Quickstart (engine + table)
 

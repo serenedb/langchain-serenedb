@@ -95,26 +95,3 @@ tests/run_tests_docker.sh -- -k hybrid -q # forward pytest args
 tests/run_tests_docker.sh --keep          # leave containers up for inspection
 tests/run_tests_docker.sh --unique        # parallel-safe project name (shared CI agent)
 ```
-
-Under the hood (and in CI) that is just:
-
-```bash
-docker compose -f tests/docker-compose.yml up \
-  --abort-on-container-exit --exit-code-from tests
-```
-
-`--exit-code-from tests` makes the whole command exit with pytest's exit code. The
-images default to `serenedb/serenedb:latest` and `serenedb/serenedb-build-ubuntu:latest`;
-override them with the `SERENEDB_IMAGE` / `BUILD_IMAGE` environment variables (or a
-`.env` file):
-
-```bash
-SERENEDB_IMAGE=serenedb/serenedb:1.2.3 docker compose -f tests/docker-compose.yml up \
-  --abort-on-container-exit --exit-code-from tests
-```
-
-To forward pytest args, set `PYTEST_ADDOPTS` (pytest reads it natively):
-
-```bash
-PYTEST_ADDOPTS="-k hybrid -q" docker compose -f tests/docker-compose.yml run --rm tests
-```
