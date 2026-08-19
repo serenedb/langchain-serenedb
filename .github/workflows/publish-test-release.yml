@@ -73,7 +73,7 @@ jobs:
             echo "Mode: FETCH attached artifacts from release id $RELEASE_ID (release '$TITLE')"
           fi
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
 

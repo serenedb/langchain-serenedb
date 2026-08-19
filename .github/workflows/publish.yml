@@ -45,7 +45,7 @@ jobs:
           if ! ls dist/*.whl >/dev/null 2>&1; then
             echo "::error::No wheel found on release $TAG -- was it prepared by prepare-release.yml?"; exit 1
           fi
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - name: Validate artifacts before upload
