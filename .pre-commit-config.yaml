@@ -1,0 +1,50 @@
+# Pre-commit hooks for formatting, sanitizing, and type-checking Python (and repo
+# hygiene). See https://pre-commit.com.
+#
+# Run EXPLICITLY -- this is intentionally NOT installed as a git hook, so the formatter
+# never rewrites a commit behind your back and you stay in control of what/when to
+# format (use `# fmt: skip` / `# noqa` / pyproject per-file-ignores for exceptions).
+#
+#   pre-commit run --all-files          # developer: apply fixes across the tree
+#
+# CI runs the same hooks as a gate (added to the PR workflow later):
+#   pre-commit run --all-files --show-diff-on-failure
+# A fix a hook would apply fails the job (printing the diff) but is never committed --
+# the CI checkout is throwaway.
+#
+# Ruff is pinned to the version locked in uv.lock so this and a local `ruff format .` /
+# `ruff check .` produce identical results. Bump both together (e.g. `pre-commit
+# autoupdate` plus a matching `uv lock`).
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml         # e.g. tests/docker-compose.yml, this file
+      - id: check-toml         # e.g. pyproject.toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.20
+    hooks:
+      - id: ruff-check         # lint + import sorting (E/F/I/T201, per pyproject)
+        args: [--fix]
+      - id: ruff-format        # formatter
+
+  # mypy runs as a local hook so it uses the project's OWN environment (with the
+  # dependencies installed) and can resolve imports -- unlike the isolated env a remote
+  # mirrors-mypy hook would need a duplicated additional_dependencies list for. It
+  # checks the whole package (not just changed files), so pass_filenames is off.
+  # Requires uv on PATH.
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: uv run --extra test mypy langchain_serenedb
+        language: system
+        types: [python]
+        pass_filenames: false
+        require_serial: true

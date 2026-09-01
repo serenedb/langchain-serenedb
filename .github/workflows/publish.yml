@@ -1,0 +1,53 @@
+name: auto | publish to pypi
+
+run-name: "publish ${{ github.event.release.tag_name }} to PyPI"
+
+# Step 2 of 2 of the release process. Fires when a GitHub Release is PUBLISHED -- which
+# also creates the git tag. prepare-release.yml (step 1) built + tested the wheel/sdist
+# and attached them to the draft; publishing that draft triggers this workflow, which
+# uploads those EXACT artifacts to PyPI via Trusted Publishing (OIDC).
+#
+# No rebuild: we publish the same bytes that were tested, and the immutable PyPI upload
+# happens only at this final, human-confirmed step -- so nothing earlier is irreversible.
+
+on:
+  release:
+    types: [published]
+
+concurrency:
+  group: publish-pypi-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  pypi-publish:
+    # Only act on version tags (vX.Y.Z), so unrelated releases don't trigger a publish.
+    if: startsWith(github.event.release.tag_name, 'v')
+    runs-on: ubuntu-latest
+    # Trusted Publishing resolves this environment name against the publisher configured
+    # on PyPI -- it must match there. Also a good place for a "required reviewer" rule.
+    environment: pypi
+    permissions:
+      id-token: write # OIDC token for PyPI Trusted Publishing (no stored secret)
+      contents: read # download the release assets
+    steps:
+      - name: Download the release artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # Pull the wheel + sdist that prepare-release.yml attached to this release.
+          # (Named assets only -- GitHub's auto "Source code" archives are not matched.)
+          gh release download "$TAG" --dir dist --pattern 'langchain_serenedb-*'
+          echo "Downloaded:"; ls -l dist/
+          if ! ls dist/*.whl >/dev/null 2>&1; then
+            echo "::error::No wheel found on release $TAG -- was it prepared by prepare-release.yml?"; exit 1
+          fi
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Validate artifacts before upload
+        run: uvx twine check dist/*
+      - uses: pypa/gh-action-pypi-publish@release/v1

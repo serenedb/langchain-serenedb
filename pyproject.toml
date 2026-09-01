@@ -1,0 +1,85 @@
+[project]
+name = "langchain-serenedb"
+dynamic = ["version"]
+description = "An integration package connecting SereneDB and LangChain"
+authors = [{ name = "SereneDB" }]
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+keywords = [
+    "langchain",
+    "serenedb",
+    "vectorstore",
+    "vector-database",
+    "embeddings",
+    "rag",
+    "postgres",
+    "psycopg",
+]
+classifiers = [
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "langchain-core>=1.2.11,<2.0",
+    "psycopg[binary]>=3,<4",
+    "psycopg-pool>=3.2.1,<4",
+    "numpy>=1.21,<3",
+]
+
+[project.urls]
+Homepage = "https://serenedb.com"
+Repository = "https://github.com/serenedb/langchain-serenedb"
+Documentation = "https://docs.serenedb.com"
+
+[project.optional-dependencies]
+test = [
+    "langchain-tests>=1.1.5",
+    "mypy>=1.15.0",
+    "pytest>=8.3.4",
+    "pytest-asyncio>=0.25.3",
+    "pytest-cov>=6.0.0",
+    "pytest-mock>=3.14.0",
+    "pytest-timeout>=2.3.1",
+    "ruff>=0.9.7",
+]
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.targets.wheel]
+packages = ["langchain_serenedb"]
+
+[tool.ruff.lint]
+select = [
+  "E",    # pycodestyle
+  "F",    # pyflakes
+  "I",    # isort
+  "T201", # print
+]
+
+[tool.ruff.lint.extend-per-file-ignores]
+"langchain_serenedb/**/*.py" = ["E501"]
+"tests/**/*.py" = ["E501"]
+
+[tool.mypy]
+disallow_untyped_defs = true
+
+[tool.coverage.run]
+omit = ["tests/*"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers --strict-config --durations=5"
+timeout = 60
+markers = []
+asyncio_mode = "auto"

@@ -1,0 +1,62 @@
+# CI / local integration harness: bring up a SereneDB instance in one container and
+# run the test suite against it from another. The test runner (run.sh) is
+# instance-agnostic, so it neither starts nor stops the database -- it just waits for
+# the `serened` service to accept connections and then runs pytest.
+#
+# No image is built here. Both services use prebuilt images that CI agents already keep
+# cached, and the test service installs any missing Python deps at startup -- so a run
+# is just `docker compose up`, no build step:
+#
+#   SERENEDB_IMAGE=serenedb/serenedb:1.2.3 docker compose -f tests/docker-compose.yml up \
+#     --abort-on-container-exit --exit-code-from tests
+#
+# Both images are variables with defaults; override them from the environment or a .env
+# file. `--exit-code-from tests` makes the whole `up` exit with pytest's exit code.
+
+# Stable, descriptive project name. Without it Compose derives the name from this file's
+# directory ("tests"), which is too generic and collides easily on shared CI agents. For
+# parallel runs of this project on one host, override per run with `docker compose -p ...`
+# or COMPOSE_PROJECT_NAME (run_tests_docker.sh --unique does exactly that).
+name: langchain-serenedb-tests
+
+services:
+  serened:
+    image: ${SERENEDB_IMAGE:-serenedb/serenedb:latest}
+    # The image's entrypoint starts serened (listening on 0.0.0.0:7890) with its data dir
+    # at /var/lib/serenedb, so no command is needed. Data lives on the container's
+    # writable layer and is discarded on removal -- what we want for isolated test runs.
+    environment:
+      # This image refuses passwordless connections over the network (only a loopback
+      # superuser is trusted), and the tests container reaches it over the Docker
+      # network. serened reads POSTGRES_PASSWORD at first init to set the `postgres`
+      # superuser password; the tests connect with the same value (see SERENEDB_PASSWORD
+      # below). Data dir is fresh each run, so this is applied every time.
+      POSTGRES_PASSWORD: ${SERENEDB_PASSWORD:-postgres}
+    expose:
+      - "7890"
+    # Uncomment to also reach the instance from the host (e.g. for debugging):
+    # ports:
+    #   - "7890:7890"
+
+  tests:
+    image: ${BUILD_IMAGE:-serenedb/serenedb-build-ubuntu:latest}
+    depends_on:
+      - serened
+    working_dir: /app
+    volumes:
+      - ..:/app
+    environment:
+      SERENEDB_HOST: serened
+      SERENEDB_PORT: "7890"
+      SERENEDB_PASSWORD: ${SERENEDB_PASSWORD:-postgres}
+      SERENEDB_WAIT_TIMEOUT: "60"
+      PYTHON: python3
+      PIP_BREAK_SYSTEM_PACKAGES: "1"
+      PYTEST_ADDOPTS: ${PYTEST_ADDOPTS:-}
+    command:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+        python3 -m pip install --no-cache-dir -r tests/requirements.txt
+        exec tests/run.sh
