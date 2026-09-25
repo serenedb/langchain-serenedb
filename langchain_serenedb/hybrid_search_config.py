@@ -51,12 +51,19 @@ class HybridIndexConfig:
 
     Attributes:
         dictionary_name: Name of the text search dictionary created for the content column.
-        dictionary_options: Options for ``CREATE TEXT SEARCH DICTIONARY`` — must include
-            ``frequency = true`` for scoring (and ``position = true`` for phrase queries,
-            ``norm = true`` for the language-model scorers).
+        dictionary_expression: Analyzer expression for ``CREATE TEXT SEARCH DICTIONARY ...
+            AS``, the form SereneDB 26.09.2 and later accept. Its ``WITH`` clause must
+            include ``frequency`` for scoring (and ``position`` for phrase queries,
+            ``norm`` for the language-model scorers).
+        dictionary_options: The same dictionary as the option list that servers before
+            26.09.2 accept. It is used only when the server rejects
+            ``dictionary_expression``.
     """
 
     dictionary_name: str = "langchain_fts_dict"
+    dictionary_expression: str = (
+        "split_text(case := 'lower') WITH (frequency, position, norm)"
+    )
     dictionary_options: str = (
         "template = 'segmentation', case = 'lower', "
         "frequency = true, position = true, norm = true"

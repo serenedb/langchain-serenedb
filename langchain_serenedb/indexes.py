@@ -171,7 +171,7 @@ class IVFQueryOptions(QueryOptions):
     """Per-session IVF search tuning.
 
     ``nprobe`` is the number of IVF cluster lists scanned per query (higher = better
-    recall, slower), applied as the ``sdb_nprobe`` session setting. ``rerank_factor``
+    recall, slower), applied as the ``sdb_ivf_search_nprobe`` session setting. ``rerank_factor``
     sizes the exact-distance rerank pool for a *quantized* index (``pool =
     rerank_factor * k``; ``0`` disables reranking), applied as ``sdb_rerank_factor``.
     A field left ``None`` is omitted so SereneDB's own default applies.
@@ -184,7 +184,7 @@ class IVFQueryOptions(QueryOptions):
         """Return ``SET LOCAL`` bodies for the options that were set (empty if none)."""
         params: list[str] = []
         if self.nprobe is not None:
-            params.append(f"sdb_nprobe = {self.nprobe}")
+            params.append(f"sdb_ivf_search_nprobe = {self.nprobe}")
         if self.rerank_factor is not None:
             params.append(f"sdb_rerank_factor = {self.rerank_factor}")
         return params
@@ -310,16 +310,27 @@ def build_json_field_selector(json_column: str, field: str, data_type: str) -> s
 
 
 def build_dictionary_ddl(
-    schema_name: str, dictionary_name: str, options: str, *, if_not_exists: bool = True
+    schema_name: str,
+    dictionary_name: str,
+    options: Optional[str] = None,
+    *,
+    expression: Optional[str] = None,
+    if_not_exists: bool = True,
 ) -> str:
     """CREATE TEXT SEARCH DICTIONARY statement (for the full-text/hybrid analyzer).
 
     Created in the table's schema so the hybrid index (which resolves the dictionary
     opclass in its own schema) can find it — a bare/other-schema dictionary is invisible
     to an index in a non-public schema.
+
+    With ``expression`` the statement uses the analyzer-expression form
+    (``AS <expression>``) of SereneDB 26.09.2 and later; otherwise it passes ``options``
+    as the option list that earlier servers accept.
     """
     ine = "IF NOT EXISTS " if if_not_exists else ""
     qualified = f"{_quote_ident(schema_name)}.{_quote_ident(dictionary_name)}"
+    if expression is not None:
+        return f"CREATE TEXT SEARCH DICTIONARY {ine}{qualified} AS {expression};"
     return f"CREATE TEXT SEARCH DICTIONARY {ine}{qualified} ({options});"
 
 
