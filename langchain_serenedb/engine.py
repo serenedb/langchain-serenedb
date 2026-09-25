@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from threading import Thread
 from typing import Any, Awaitable, Optional, Sequence, TypedDict, TypeVar, Union, cast
 
+import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
@@ -182,6 +183,29 @@ class SereneDBEngine:
         async with self._pool.connection() as conn:
             await conn.execute(query, params)
             await conn.commit()
+
+    async def _acreate_dictionary(
+        self, schema_name: str, config: HybridIndexConfig
+    ) -> None:
+        """Create the text search dictionary of ``config`` in ``schema_name``.
+
+        Uses the analyzer-expression form of SereneDB 26.09.2 and later, and falls back
+        to the option list when the server does not parse it.
+        """
+        try:
+            await self._aexecute(
+                build_dictionary_ddl(
+                    schema_name,
+                    config.dictionary_name,
+                    expression=config.dictionary_expression,
+                )
+            )
+        except psycopg.errors.SyntaxError:
+            await self._aexecute(
+                build_dictionary_ddl(
+                    schema_name, config.dictionary_name, config.dictionary_options
+                )
+            )
 
     async def _aexecute_many(
         self, query: str, params_seq: Sequence[Union[dict, Sequence]]
@@ -356,13 +380,7 @@ class SereneDBEngine:
                 metadata_columns=raw_metadata_columns,
             )
             if hybrid_index_config is not None:
-                await self._aexecute(
-                    build_dictionary_ddl(
-                        raw_schema_name,
-                        hybrid_index_config.dictionary_name,
-                        hybrid_index_config.dictionary_options,
-                    )
-                )
+                await self._acreate_dictionary(raw_schema_name, hybrid_index_config)
                 await self._aexecute(
                     build_hybrid_index_ddl(
                         schema_name=raw_schema_name,

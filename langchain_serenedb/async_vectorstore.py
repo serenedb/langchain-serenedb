@@ -39,7 +39,6 @@ from .indexes import (
     JsonFieldIndex,
     MetadataIndexConfig,
     QueryOptions,
-    build_dictionary_ddl,
     build_hybrid_index_ddl,
     build_json_field_selector,
     build_metadata_index_entries,
@@ -927,11 +926,7 @@ class AsyncSereneDBVectorStore(VectorStore):
 
     async def _acreate_text_search_dictionary(self, config: HybridIndexConfig) -> None:
         """Create the text search dictionary used to analyze the content column."""
-        await self.engine._aexecute(
-            build_dictionary_ddl(
-                self.schema_name, config.dictionary_name, config.dictionary_options
-            )
-        )
+        await self.engine._acreate_dictionary(self.schema_name, config)
 
     async def _abuild_index(
         self, index: BaseIndex, index_config: Optional[HybridIndexConfig]
