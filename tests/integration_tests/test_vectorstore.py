@@ -321,9 +321,9 @@ def test_ivf_quantized_index_and_search():
 def test_ivf_query_options_to_parameter():
     """IVFQueryOptions emits SET LOCAL bodies only for the fields that are set."""
     assert IVFQueryOptions().to_parameter() == []
-    assert IVFQueryOptions(nprobe=10).to_parameter() == ["sdb_nprobe = 10"]
+    assert IVFQueryOptions(nprobe=10).to_parameter() == ["sdb_ivf_search_nprobe = 10"]
     assert IVFQueryOptions(nprobe=10, rerank_factor=4).to_parameter() == [
-        "sdb_nprobe = 10",
+        "sdb_ivf_search_nprobe = 10",
         "sdb_rerank_factor = 4",
     ]
 
@@ -332,8 +332,9 @@ def test_ivf_query_options_nprobe_reaches_db():
     """IVFQueryOptions is actually applied to the query as a SET LOCAL prelude.
 
     Proven behaviorally: a valid nprobe searches fine, while nprobe=0 (which SereneDB
-    rejects -- sdb_nprobe must be >= 1) makes the search raise. That error can only occur
-    if the ``SET LOCAL sdb_nprobe`` prelude genuinely reached the database.
+    rejects -- sdb_ivf_search_nprobe must be >= 1) makes the search raise. That error can
+    only occur if the ``SET LOCAL sdb_ivf_search_nprobe`` prelude genuinely reached the
+    database.
     """
     table = f"lc_ivfnp_{uuid.uuid4().hex[:8]}"
     engine = SereneDBEngine.from_connection_string(CONNINFO)
@@ -353,7 +354,7 @@ def test_ivf_query_options_nprobe_reaches_db():
         )
         with pytest.raises(Exception) as exc:
             bad.similarity_search("green", k=1)
-        assert "sdb_nprobe" in str(exc.value)
+        assert "sdb_ivf_search_nprobe" in str(exc.value)
     finally:
         engine.drop_table(table)
         engine.close()
@@ -1330,10 +1331,14 @@ def _make_phrase_store(titles):
         table, DIM, overwrite_existing=True, metadata_columns=[Column("title", "TEXT")]
     )
     engine._run_as_sync(
-        engine._aexecute(
-            f'CREATE TEXT SEARCH DICTIONARY "public"."{dict_name}" '
-            "(template = 'segmentation', case = 'lower', "
-            "frequency = true, position = true)"
+        engine._acreate_dictionary(
+            "public",
+            HybridIndexConfig(
+                dictionary_name=dict_name,
+                dictionary_expression=(
+                    "split_text(case := 'lower') WITH (frequency, position)"
+                ),
+            ),
         )
     )
     mi = MetadataIndexConfig(
@@ -1484,8 +1489,9 @@ def test_fts_on_declared_json_text_field():
 def test_fts_ngram_on_dictionary_indexed_column():
     """$ngram works on a metadata column indexed with an n-gram dictionary.
 
-    ts_ngram needs the column tokenized by an n-gram dictionary (with frequency AND
-    position); we can't enforce that from the client, so the user creates the dictionary
+    ts_ngram needs the column tokenized by an n-gram dictionary of a single gram size
+    (min_gram == max_gram, so each position holds one token) with frequency AND
+    position; we can't enforce that from the client, so the user creates the dictionary
     and indexes the column with it. Here we set that up explicitly.
     """
     table = f"lc_ngram_{uuid.uuid4().hex[:8]}"
@@ -1495,10 +1501,12 @@ def test_fts_ngram_on_dictionary_indexed_column():
         table, DIM, overwrite_existing=True, metadata_columns=[Column("title", "TEXT")]
     )
     engine._run_as_sync(
-        engine._aexecute(
-            f'CREATE TEXT SEARCH DICTIONARY "public"."{dict_name}" '
-            "(template = 'ngram', mingram = 2, maxgram = 3, "
-            "frequency = true, position = true)"
+        engine._acreate_dictionary(
+            "public",
+            HybridIndexConfig(
+                dictionary_name=dict_name,
+                dictionary_expression="generate_ngrams(2, 2) WITH (frequency, position)",
+            ),
         )
     )
     mi = MetadataIndexConfig(
@@ -1526,7 +1534,9 @@ def test_fts_ngram_on_dictionary_indexed_column():
                 filter={"title": {"$ngram": {"text": "hello", "threshold": 0.3}}},
             )
         )
-        assert "hello" in got
+        # Bigrams: "help" shares he/el with "hello" (2/4 = 0.5 >= 0.3); "world"
+        # shares none.
+        assert got == ["hello", "help"]
     finally:
         engine.drop_table(table)
         engine._run_as_sync(

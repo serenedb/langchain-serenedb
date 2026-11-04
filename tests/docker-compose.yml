@@ -58,5 +58,7 @@ services:
       - -c
       - |
         set -euo pipefail
-        python3 -m pip install --no-cache-dir -r tests/requirements.txt
+        # The build image sets PIP_NO_INDEX=1 (offline pip), so lift it for this
+        # install; otherwise pip sees no versions of anything on PyPI.
+        env -u PIP_NO_INDEX python3 -m pip install --no-cache-dir -r tests/requirements.txt
         exec tests/run.sh

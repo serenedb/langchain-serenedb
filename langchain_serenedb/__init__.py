@@ -8,7 +8,12 @@ inverted index, and BM25 full-text search.
 from importlib import metadata
 
 from langchain_serenedb.async_vectorstore import AsyncSereneDBVectorStore
-from langchain_serenedb.engine import Column, ColumnDict, SereneDBEngine
+from langchain_serenedb.engine import (
+    Column,
+    ColumnDict,
+    SereneDBEngine,
+    UnsupportedServerVersionError,
+)
 from langchain_serenedb.hybrid_search_config import (
     FusionStrategy,
     HybridIndexConfig,
@@ -46,4 +51,5 @@ __all__ = [
     "MetadataIndexConfig",
     "SereneDBEngine",
     "SereneDBVectorStore",
+    "UnsupportedServerVersionError",
 ]

@@ -51,15 +51,14 @@ class HybridIndexConfig:
 
     Attributes:
         dictionary_name: Name of the text search dictionary created for the content column.
-        dictionary_options: Options for ``CREATE TEXT SEARCH DICTIONARY`` — must include
-            ``frequency = true`` for scoring (and ``position = true`` for phrase queries,
-            ``norm = true`` for the language-model scorers).
+        dictionary_expression: Analyzer expression for ``CREATE TEXT SEARCH DICTIONARY ...
+            AS``. Its ``WITH`` clause must include ``frequency`` for scoring (and
+            ``position`` for phrase queries, ``norm`` for the language-model scorers).
     """
 
     dictionary_name: str = "langchain_fts_dict"
-    dictionary_options: str = (
-        "template = 'segmentation', case = 'lower', "
-        "frequency = true, position = true, norm = true"
+    dictionary_expression: str = (
+        "split_text(case := 'lower') WITH (frequency, position, norm)"
     )
 
 
