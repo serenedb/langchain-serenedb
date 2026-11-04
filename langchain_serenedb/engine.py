@@ -8,12 +8,12 @@ synchronous API delegate to the async implementation.
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 from threading import Thread
 from typing import Any, Awaitable, Optional, Sequence, TypedDict, TypeVar, Union, cast
 
-import psycopg
-from psycopg.rows import dict_row
+from psycopg.rows import dict_row, tuple_row
 from psycopg_pool import AsyncConnectionPool
 
 from .hybrid_search_config import HybridIndexConfig
@@ -29,6 +29,32 @@ from .indexes import (
 )
 
 T = TypeVar("T")
+
+MIN_SUPPORTED_SERVER_VERSION: tuple[int, ...] = (26, 11, 2)
+"""Oldest SereneDB server release this package supports."""
+
+# ``SELECT version()`` reports e.g. ``PostgreSQL 18.3 (SereneDB 26.11.2)``; the
+# SereneDB part may carry a fourth component and a release-type suffix
+# (``26.09.1.1-lts``).
+_SERVER_VERSION_RE = re.compile(r"SereneDB\s+(\d+(?:\.\d+)*)")
+
+
+class UnsupportedServerVersionError(RuntimeError):
+    """Raised when the connected SereneDB server is older than the supported minimum."""
+
+
+def _parse_server_version(version_text: str) -> Optional[tuple[int, ...]]:
+    """Extract the SereneDB release from ``version()`` output, or ``None`` if absent."""
+    match = _SERVER_VERSION_RE.search(version_text)
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def _format_version(version: tuple[int, ...]) -> str:
+    return ".".join(
+        f"{part:02d}" if i == 1 else str(part) for i, part in enumerate(version)
+    )
 
 
 class ColumnDict(TypedDict):
@@ -69,6 +95,7 @@ class SereneDBEngine:
         pool: AsyncConnectionPool,
         loop: Optional[asyncio.AbstractEventLoop],
         thread: Optional[Thread],
+        ignore_db_version: bool = False,
     ) -> None:
         """SereneDBEngine constructor.
 
@@ -77,6 +104,7 @@ class SereneDBEngine:
             pool (AsyncConnectionPool): Async psycopg connection pool.
             loop (Optional[asyncio.AbstractEventLoop]): Async event loop used to create the engine.
             thread (Optional[Thread]): Thread used to create the engine async.
+            ignore_db_version (bool): Skip the server version check.
 
         Raises:
             Exception: If the constructor is called directly by the user.
@@ -89,34 +117,68 @@ class SereneDBEngine:
         self._loop = loop
         self._thread = thread
         self._opened = False
+        self._version_checked = ignore_db_version
+        self._server_version: Optional[tuple[int, ...]] = None
 
     @classmethod
     def from_pool(
         cls: type[SereneDBEngine],
         pool: AsyncConnectionPool,
         loop: Optional[asyncio.AbstractEventLoop] = None,
+        *,
+        ignore_db_version: bool = False,
     ) -> SereneDBEngine:
-        """Create a SereneDBEngine instance from an existing AsyncConnectionPool."""
-        engine = cls(cls.__create_key, pool, loop, None)
+        """Create a SereneDBEngine instance from an existing, opened AsyncConnectionPool.
+
+        Args:
+            pool (AsyncConnectionPool): An opened async psycopg connection pool.
+            loop (Optional[asyncio.AbstractEventLoop]): Event loop that drives ``pool``.
+                Required for the sync API.
+            ignore_db_version (bool): Skip the server version check. The caller then
+                takes the risk that some queries misbehave on an unsupported server.
+
+        The server version is checked here when ``loop`` runs in another thread. When
+        no such loop is given (or it is the caller's own running loop, which cannot be
+        blocked on), the check runs before the engine's first query instead.
+
+        Raises:
+            UnsupportedServerVersionError: If the server is older than the supported
+                minimum and ``ignore_db_version`` is false.
+        """
+        engine = cls(
+            cls.__create_key, pool, loop, None, ignore_db_version=ignore_db_version
+        )
         engine._opened = True
+        if loop is not None and not engine._is_running_in_current_thread(loop):
+            engine._run_as_sync(engine._ensure_open())
         return engine
 
     @classmethod
     def from_connection_string(
         cls,
         conninfo: str,
+        *,
+        ignore_db_version: bool = False,
         **kwargs: Any,
     ) -> SereneDBEngine:
         """Create a SereneDBEngine from a psycopg connection string.
 
+        Connects to the server and checks its version before returning.
+
         Args:
             conninfo (str): libpq connection string, e.g.
                 ``"host=127.0.0.1 port=7890 user=postgres dbname=postgres"``.
+            ignore_db_version (bool): Skip the server version check. The caller then
+                takes the risk that some queries misbehave on an unsupported server.
             **kwargs (Any): Extra keyword arguments forwarded to
                 ``psycopg_pool.AsyncConnectionPool`` (e.g. ``min_size``, ``max_size``).
 
         Returns:
             SereneDBEngine
+
+        Raises:
+            UnsupportedServerVersionError: If the server is older than the supported
+                minimum and ``ignore_db_version`` is false.
         """
         # Running a loop in a background thread allows us to support
         # async methods from non-async environments.
@@ -129,13 +191,41 @@ class SereneDBEngine:
 
         connection_kwargs = kwargs.pop("kwargs", {})
         connection_kwargs.setdefault("row_factory", dict_row)
-        # The pool is created but not opened here; it is opened lazily on the
-        # background loop before its first use (AsyncConnectionPool must be opened
-        # inside the running event loop).
+        # The pool is created closed and opened on the background loop
+        # (AsyncConnectionPool must be opened inside the running event loop).
         pool = AsyncConnectionPool(
             conninfo, open=False, kwargs=connection_kwargs, **kwargs
         )
-        return cls(cls.__create_key, pool, cls._default_loop, cls._default_thread)
+        engine = cls(
+            cls.__create_key,
+            pool,
+            cls._default_loop,
+            cls._default_thread,
+            ignore_db_version=ignore_db_version,
+        )
+        if not ignore_db_version:
+            try:
+                engine._run_as_sync(engine._ensure_open())
+            except BaseException:
+                engine._run_as_sync(pool.close())
+                raise
+        return engine
+
+    @staticmethod
+    def _is_running_in_current_thread(loop: asyncio.AbstractEventLoop) -> bool:
+        try:
+            return asyncio.get_running_loop() is loop
+        except RuntimeError:
+            return False
+
+    @property
+    def server_version(self) -> Optional[tuple[int, ...]]:
+        """SereneDB release of the connected server, e.g. ``(26, 11, 2)``.
+
+        ``None`` until the version check has run, and always ``None`` when the engine
+        was created with ``ignore_db_version=True``.
+        """
+        return self._server_version
 
     async def _run_as_async(self, coro: Awaitable[T]) -> T:
         """Run an async coroutine asynchronously."""
@@ -156,10 +246,31 @@ class SereneDBEngine:
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result()  # type: ignore[arg-type]
 
     async def _ensure_open(self) -> None:
-        """Open the connection pool lazily, on the loop that will drive it."""
+        """Open the connection pool if needed and check the server version once."""
         if not self._opened:
             await self._pool.open()
             self._opened = True
+        if not self._version_checked:
+            await self._acheck_server_version()
+
+    async def _acheck_server_version(self) -> None:
+        """Raise unless the server is at least :data:`MIN_SUPPORTED_SERVER_VERSION`."""
+        async with self._pool.connection() as conn:
+            async with conn.cursor(row_factory=tuple_row) as cur:
+                await cur.execute("SELECT version()")
+                row = await cur.fetchone()
+            await conn.commit()
+        version_text = str(row[0]) if row else ""
+        version = _parse_server_version(version_text)
+        if version is None or version < MIN_SUPPORTED_SERVER_VERSION:
+            shown = _format_version(version) if version is not None else version_text
+            raise UnsupportedServerVersionError(
+                f"version {shown} is not supported. Minimum supported version is "
+                f"{_format_version(MIN_SUPPORTED_SERVER_VERSION)}. To disable version "
+                "check use ignore_db_version=True"
+            )
+        self._server_version = version
+        self._version_checked = True
 
     async def aclose(self) -> None:
         """Dispose of the connection pool."""
@@ -187,25 +298,12 @@ class SereneDBEngine:
     async def _acreate_dictionary(
         self, schema_name: str, config: HybridIndexConfig
     ) -> None:
-        """Create the text search dictionary of ``config`` in ``schema_name``.
-
-        Uses the analyzer-expression form of SereneDB 26.09.2 and later, and falls back
-        to the option list when the server does not parse it.
-        """
-        try:
-            await self._aexecute(
-                build_dictionary_ddl(
-                    schema_name,
-                    config.dictionary_name,
-                    expression=config.dictionary_expression,
-                )
+        """Create the text search dictionary of ``config`` in ``schema_name``."""
+        await self._aexecute(
+            build_dictionary_ddl(
+                schema_name, config.dictionary_name, config.dictionary_expression
             )
-        except psycopg.errors.SyntaxError:
-            await self._aexecute(
-                build_dictionary_ddl(
-                    schema_name, config.dictionary_name, config.dictionary_options
-                )
-            )
+        )
 
     async def _aexecute_many(
         self, query: str, params_seq: Sequence[Union[dict, Sequence]]

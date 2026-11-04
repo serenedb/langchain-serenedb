@@ -1338,10 +1338,6 @@ def _make_phrase_store(titles):
                 dictionary_expression=(
                     "split_text(case := 'lower') WITH (frequency, position)"
                 ),
-                dictionary_options=(
-                    "template = 'segmentation', case = 'lower', "
-                    "frequency = true, position = true"
-                ),
             ),
         )
     )
@@ -1493,8 +1489,9 @@ def test_fts_on_declared_json_text_field():
 def test_fts_ngram_on_dictionary_indexed_column():
     """$ngram works on a metadata column indexed with an n-gram dictionary.
 
-    ts_ngram needs the column tokenized by an n-gram dictionary (with frequency AND
-    position); we can't enforce that from the client, so the user creates the dictionary
+    ts_ngram needs the column tokenized by an n-gram dictionary of a single gram size
+    (min_gram == max_gram, so each position holds one token) with frequency AND
+    position; we can't enforce that from the client, so the user creates the dictionary
     and indexes the column with it. Here we set that up explicitly.
     """
     table = f"lc_ngram_{uuid.uuid4().hex[:8]}"
@@ -1508,11 +1505,7 @@ def test_fts_ngram_on_dictionary_indexed_column():
             "public",
             HybridIndexConfig(
                 dictionary_name=dict_name,
-                dictionary_expression="generate_ngrams(2, 3) WITH (frequency, position)",
-                dictionary_options=(
-                    "template = 'ngram', mingram = 2, maxgram = 3, "
-                    "frequency = true, position = true"
-                ),
+                dictionary_expression="generate_ngrams(2, 2) WITH (frequency, position)",
             ),
         )
     )
@@ -1541,7 +1534,9 @@ def test_fts_ngram_on_dictionary_indexed_column():
                 filter={"title": {"$ngram": {"text": "hello", "threshold": 0.3}}},
             )
         )
-        assert "hello" in got
+        # Bigrams: "help" shares he/el with "hello" (2/4 = 0.5 >= 0.3); "world"
+        # shares none.
+        assert got == ["hello", "help"]
     finally:
         engine.drop_table(table)
         engine._run_as_sync(

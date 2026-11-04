@@ -312,26 +312,20 @@ def build_json_field_selector(json_column: str, field: str, data_type: str) -> s
 def build_dictionary_ddl(
     schema_name: str,
     dictionary_name: str,
-    options: Optional[str] = None,
+    expression: str,
     *,
-    expression: Optional[str] = None,
     if_not_exists: bool = True,
 ) -> str:
     """CREATE TEXT SEARCH DICTIONARY statement (for the full-text/hybrid analyzer).
 
     Created in the table's schema so the hybrid index (which resolves the dictionary
     opclass in its own schema) can find it — a bare/other-schema dictionary is invisible
-    to an index in a non-public schema.
-
-    With ``expression`` the statement uses the analyzer-expression form
-    (``AS <expression>``) of SereneDB 26.09.2 and later; otherwise it passes ``options``
-    as the option list that earlier servers accept.
+    to an index in a non-public schema. ``expression`` is the analyzer expression
+    (``AS <expression>``).
     """
     ine = "IF NOT EXISTS " if if_not_exists else ""
     qualified = f"{_quote_ident(schema_name)}.{_quote_ident(dictionary_name)}"
-    if expression is not None:
-        return f"CREATE TEXT SEARCH DICTIONARY {ine}{qualified} AS {expression};"
-    return f"CREATE TEXT SEARCH DICTIONARY {ine}{qualified} ({options});"
+    return f"CREATE TEXT SEARCH DICTIONARY {ine}{qualified} AS {expression};"
 
 
 def build_metadata_index_entries(
