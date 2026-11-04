@@ -363,15 +363,19 @@ class AsyncSereneDBVectorStore(VectorStore):
         params: Optional[dict] = None,
         prelude: Optional[list[str]] = None,
     ) -> list[dict[str, Any]]:
-        """Run ``prelude`` statements (e.g. ``SET LOCAL``) then ``query`` on one conn."""
+        """Run ``prelude`` statements (e.g. ``SET LOCAL``) then ``query`` on one conn.
+
+        Both run in one explicit transaction, which is the scope ``SET LOCAL`` applies
+        to, even on a connection in autocommit mode (e.g. from a user-supplied pool).
+        """
         await self.engine._ensure_open()
         async with self.engine._pool.connection() as conn:
-            if prelude:
-                for stmt in prelude:
-                    await conn.execute(stmt)
-            cur = await conn.execute(query, params)
-            rows = await cur.fetchall()
-            await conn.commit()
+            async with conn.transaction():
+                if prelude:
+                    for stmt in prelude:
+                        await conn.execute(stmt)
+                cur = await conn.execute(query, params)
+                rows = await cur.fetchall()
         # The pool sets row_factory=dict_row, so rows are dicts; psycopg's stubs cannot
         # see the dynamically-set factory and still type them as tuples.
         return cast(list[dict[str, Any]], rows)

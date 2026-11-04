@@ -338,8 +338,14 @@ class SereneDBEngine:
         """Execute a statement that cannot run inside a transaction (e.g. VACUUM)."""
         await self._ensure_open()
         async with self._pool.connection() as conn:
+            previous = conn.autocommit
             await conn.set_autocommit(True)
-            await conn.execute(query)
+            try:
+                await conn.execute(query)
+            finally:
+                # The connection goes back to the pool; leaving it in autocommit would
+                # make a later SET LOCAL on it run outside any transaction.
+                await conn.set_autocommit(previous)
 
     @staticmethod
     def _escape_identifier(name: str) -> str:

@@ -171,22 +171,26 @@ class IVFQueryOptions(QueryOptions):
     """Per-session IVF search tuning.
 
     ``nprobe`` is the number of IVF cluster lists scanned per query (higher = better
-    recall, slower), applied as the ``sdb_ivf_search_nprobe`` session setting. ``rerank_factor``
-    sizes the exact-distance rerank pool for a *quantized* index (``pool =
-    rerank_factor * k``; ``0`` disables reranking), applied as ``sdb_rerank_factor``.
-    A field left ``None`` is omitted so SereneDB's own default applies.
+    recall, slower), applied as the ``sdb_ivf_search_nprobe`` session setting.
+    ``rescore_width`` applies to a *quantized* index only, as ``sdb_ann_rescore_width``:
+    the search runs on the quantized codes, and a candidate is re-read at full precision
+    while its code score plus ``rescore_width`` times the code's estimated error could
+    still beat the k-th best exact score. Larger values rescore more candidates and miss
+    fewer neighbours; ``0`` answers from the codes alone; ``-1`` lets SereneDB pick a
+    width for the index's quantizer. A field left ``None`` is omitted so SereneDB's own
+    default applies.
     """
 
     nprobe: Optional[int] = None
-    rerank_factor: Optional[int] = None
+    rescore_width: Optional[float] = None
 
     def to_parameter(self) -> list[str]:
         """Return ``SET LOCAL`` bodies for the options that were set (empty if none)."""
         params: list[str] = []
         if self.nprobe is not None:
             params.append(f"sdb_ivf_search_nprobe = {self.nprobe}")
-        if self.rerank_factor is not None:
-            params.append(f"sdb_rerank_factor = {self.rerank_factor}")
+        if self.rescore_width is not None:
+            params.append(f"sdb_ann_rescore_width = {self.rescore_width}")
         return params
 
     def to_string(self) -> str:
