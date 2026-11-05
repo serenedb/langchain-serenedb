@@ -1,14 +1,16 @@
 """Index classes for adding vector indexes on the SereneDBVectorStore.
 
 SereneDB provides approximate-nearest-neighbor search through an **inverted index**
-with an ``ivf`` operator class on a fixed-size ``FLOAT[N]`` column::
+with an ``ivf`` or ``hnsw`` operator class on a fixed-size ``FLOAT[N]`` column::
 
     CREATE INDEX idx ON tbl USING inverted (embedding ivf (metric = 'cosine', quant = 'sq8'))
+    CREATE INDEX idx ON tbl USING inverted (embedding hnsw (metric = 'cosine', m = 32))
 
-IVF is the ANN index type. The distance *metric* is required and must match the operator
-used at query time for the index to accelerate the search; optional quantization
-(``quant``) trades recall for memory/speed. See
-https://<serenedb-docs>/sql/indexes/inverted/vector-search.
+:class:`IVFIndex` and :class:`HNSWIndex` configure the two index types. The distance
+*metric* is required and must match the operator used at query time for the index to
+accelerate the search; optional quantization (``quant``) trades recall for memory/speed.
+A collection has one vector index at a time, of either type. See
+https://serenedb.com/docs/sql/indexes/inverted/vector-search.
 """
 
 import enum
@@ -17,7 +19,7 @@ import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import ClassVar, Optional
 
 
 @dataclass
@@ -28,7 +30,7 @@ class StrategyMixin:
         operator: The infix distance operator used in ``ORDER BY`` (e.g. ``<=>``).
         search_function: The named scalar distance function used to compute the
             score column (e.g. ``cosine_distance``).
-        index_metric: The ``metric`` value the IVF index must be built with for the
+        index_metric: The ``metric`` value the vector index must be built with for the
             operator to accelerate (one of ``l2``, ``cosine``, ``ip``, ``l1``).
     """
 
@@ -40,7 +42,7 @@ class StrategyMixin:
 class DistanceStrategy(StrategyMixin, enum.Enum):
     """Enumerator of the distance strategies supported by SereneDB.
 
-    Each strategy bundles the query operator, the named distance function and the IVF
+    Each strategy bundles the query operator, the named distance function and the vector
     index ``metric`` for one distance measure: Euclidean (L2), cosine, inner product,
     and Manhattan (L1).
     """
@@ -111,6 +113,16 @@ class BaseIndex(ABC):
 
 @dataclass
 class QueryOptions(ABC):
+    """Per-query search settings, applied as ``SET LOCAL`` before each search.
+
+    ``index_type`` names the vector index type the settings tune (matching
+    :attr:`BaseIndex.index_type`). The store refuses to search a collection whose index
+    is of a different type with them, since SereneDB would silently ignore the
+    settings. ``None`` means the settings apply to any index type.
+    """
+
+    index_type: ClassVar[Optional[str]] = None
+
     @abstractmethod
     def to_parameter(self) -> list[str]:
         """Convert index attributes to list of configurations."""
@@ -122,20 +134,49 @@ class QueryOptions(ABC):
         raise NotImplementedError("to_string method must be implemented by subclass")
 
 
+def _quantization_options(
+    quant: Optional[str],
+    pq_m: Optional[int],
+    nb_bits: Optional[int],
+    query_bits: Optional[int],
+    compression: Optional[bool],
+) -> list[str]:
+    """Render the quantization options shared by the ``ivf`` and ``hnsw`` opclasses."""
+    opts: list[str] = []
+    if quant is not None:
+        opts.append(f"quant = '{quant}'")
+    if pq_m is not None:
+        opts.append(f"pq_m = {pq_m}")
+    if nb_bits is not None:
+        opts.append(f"nb_bits = {nb_bits}")
+    if query_bits is not None:
+        opts.append(f"query_bits = {query_bits}")
+    if compression is not None:
+        opts.append(f"compression = {str(compression).lower()}")
+    return opts
+
+
 @dataclass
 class IVFIndex(BaseIndex):
     """IVF inverted-index configuration.
 
     The ``metric`` is derived from :attr:`distance_strategy`. Every other option is
     optional and, when left ``None``, is omitted from the DDL so SereneDB chooses its
-    default (the number of cluster lists is auto-scaled with the row count).
+    default (the number of cluster lists is auto-scaled with the row count, and vectors
+    are quantized with ``sq8`` for the ``l2``, ``ip`` and ``cosine`` metrics).
 
     Attributes:
-        quant: Vector quantization — one of ``"sq8"``, ``"sq4"``, ``"pq"``,
-            ``"rabitq"``, ``"none"``. Quantized modes require metric ``l2`` or ``ip``.
+        quant: Vector quantization, e.g. ``"sq8"``, ``"sq4"``, ``"usq8"``, ``"usq4"``,
+            ``"fp16"``, ``"bf16"``, ``"pq"``, ``"rabitq"``, ``"tq"``, ``"bq"``,
+            ``"osq"`` or ``"none"`` (full precision). See the SereneDB vector search
+            documentation for the full list and which metrics each supports.
         pq_m: Number of PQ sub-quantizers (must divide the vector dimension); valid only
             with ``quant="pq"``.
-        rabitq_bits: RaBitQ bit count (1-9); valid only with ``quant="rabitq"``.
+        rabitq_bits: Deprecated; use ``nb_bits``. Sent to the server as ``nb_bits``.
+        nb_bits: Bits per stored code for the quantizers that take a bit count
+            (``rabitq``, ``tq``, ``bq``, ``osq``).
+        query_bits: Bits used to quantize the query vector; valid only with
+            ``quant="bq"`` or ``quant="osq"``.
         compression: When ``False``, store the index vectors uncompressed (default is
             ``True`` in the database).
 
@@ -146,7 +187,25 @@ class IVFIndex(BaseIndex):
     quant: Optional[str] = None
     pq_m: Optional[int] = None
     rabitq_bits: Optional[int] = None
+    nb_bits: Optional[int] = None
+    query_bits: Optional[int] = None
     compression: Optional[bool] = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.rabitq_bits is not None:
+            warnings.warn(
+                "IVFIndex(rabitq_bits=...) is deprecated and will be removed in a "
+                "future release; use nb_bits instead.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            if self.nb_bits is not None and self.nb_bits != self.rabitq_bits:
+                raise ValueError(
+                    f"IVFIndex got rabitq_bits={self.rabitq_bits} and "
+                    f"nb_bits={self.nb_bits}; they are the same setting. Set only "
+                    "nb_bits."
+                )
 
     def index_options(self) -> str:
         """Return the ``ivf`` operator-class spec for the embedding column.
@@ -155,15 +214,62 @@ class IVFIndex(BaseIndex):
         ``ivf (metric = 'l2', quant = 'sq8', compression = false)``.
         """
         opts = [f"metric = '{self.get_index_metric()}'"]
-        if self.quant is not None:
-            opts.append(f"quant = '{self.quant}'")
-        if self.pq_m is not None:
-            opts.append(f"pq_m = {self.pq_m}")
-        if self.rabitq_bits is not None:
-            opts.append(f"rabitq_bits = {self.rabitq_bits}")
-        if self.compression is not None:
-            opts.append(f"compression = {str(self.compression).lower()}")
+        nb_bits = self.nb_bits if self.nb_bits is not None else self.rabitq_bits
+        opts += _quantization_options(
+            self.quant, self.pq_m, nb_bits, self.query_bits, self.compression
+        )
         return f"ivf ({', '.join(opts)})"
+
+
+@dataclass
+class HNSWIndex(BaseIndex):
+    """HNSW inverted-index configuration.
+
+    HNSW searches a navigable graph of the vectors. Metadata filters are applied during
+    the graph walk, so filtered searches keep returning ``k`` results. The ``metric`` is
+    derived from :attr:`distance_strategy`; every other option is optional and, when
+    left ``None``, is omitted from the DDL so SereneDB chooses its default.
+
+    Attributes:
+        m: Maximum number of graph neighbours per vector (SereneDB default 32, at least
+            2). Larger values improve recall and use more memory.
+        ef_construction: Candidate-list size while building the graph (SereneDB default
+            200, at least ``m``). Larger values build a better graph, more slowly.
+        quant: Vector quantization, as for :class:`IVFIndex` (SereneDB default
+            ``"sq8"``; the ``l1`` metric supports only ``"none"``).
+        pq_m: Number of PQ sub-quantizers; valid only with ``quant="pq"``.
+        nb_bits: Bits per stored code for the quantizers that take a bit count.
+        query_bits: Bits used to quantize the query vector; valid only with
+            ``quant="bq"`` or ``quant="osq"``.
+        compression: When ``False``, store the index vectors uncompressed.
+
+    Option combinations are validated by the database at CREATE INDEX time, not here.
+    """
+
+    index_type: str = "hnsw"
+    m: Optional[int] = None
+    ef_construction: Optional[int] = None
+    quant: Optional[str] = None
+    pq_m: Optional[int] = None
+    nb_bits: Optional[int] = None
+    query_bits: Optional[int] = None
+    compression: Optional[bool] = None
+
+    def index_options(self) -> str:
+        """Return the ``hnsw`` operator-class spec for the embedding column.
+
+        Only the options that are set are emitted, e.g. ``hnsw (metric = 'cosine')`` or
+        ``hnsw (metric = 'l2', m = 16, ef_construction = 64)``.
+        """
+        opts = [f"metric = '{self.get_index_metric()}'"]
+        if self.m is not None:
+            opts.append(f"m = {self.m}")
+        if self.ef_construction is not None:
+            opts.append(f"ef_construction = {self.ef_construction}")
+        opts += _quantization_options(
+            self.quant, self.pq_m, self.nb_bits, self.query_bits, self.compression
+        )
+        return f"hnsw ({', '.join(opts)})"
 
 
 @dataclass
@@ -180,6 +286,8 @@ class IVFQueryOptions(QueryOptions):
     width for the index's quantizer. A field left ``None`` is omitted so SereneDB's own
     default applies.
     """
+
+    index_type: ClassVar[Optional[str]] = "ivf"
 
     nprobe: Optional[int] = None
     rescore_width: Optional[float] = None
@@ -200,6 +308,58 @@ class IVFQueryOptions(QueryOptions):
             DeprecationWarning,
         )
         return "; ".join(self.to_parameter())
+
+
+@dataclass
+class HNSWQueryOptions(QueryOptions):
+    """Per-session HNSW search tuning.
+
+    ``ef_search`` is the candidate-list size of the graph search (higher = better
+    recall, slower), applied as the ``sdb_hnsw_ef_search`` session setting; ``-1`` lets
+    SereneDB size it from ``k``. ``rescore_width`` applies to a *quantized* index only,
+    as ``sdb_ann_rescore_width``, with the same meaning as in :class:`IVFQueryOptions`.
+    A field left ``None`` is omitted so SereneDB's own default applies.
+    """
+
+    index_type: ClassVar[Optional[str]] = "hnsw"
+
+    ef_search: Optional[int] = None
+    rescore_width: Optional[float] = None
+
+    def to_parameter(self) -> list[str]:
+        """Return ``SET LOCAL`` bodies for the options that were set (empty if none)."""
+        params: list[str] = []
+        if self.ef_search is not None:
+            params.append(f"sdb_hnsw_ef_search = {self.ef_search}")
+        if self.rescore_width is not None:
+            params.append(f"sdb_ann_rescore_width = {self.rescore_width}")
+        return params
+
+    def to_string(self) -> str:
+        """Convert index attributes to string."""
+        warnings.warn(
+            "to_string is deprecated, use to_parameter instead.",
+            DeprecationWarning,
+        )
+        return "; ".join(self.to_parameter())
+
+
+def vector_index_type_from_indexdef(
+    indexdef: str, embedding_column: str
+) -> Optional[str]:
+    """Return the vector opclass (``"ivf"``/``"hnsw"``) applied to ``embedding_column``.
+
+    ``indexdef`` is the ``pg_indexes.indexdef`` text, in which SereneDB prints each
+    indexed column followed by its opclass, e.g. ``(embedding hnsw (m='16', metric=l2),
+    id)``. Returns ``None`` when the embedding column carries neither opclass.
+    """
+    column = re.escape(embedding_column)
+    match = re.search(
+        rf'(?:"{column}"|(?<![\w"]){column})\s+(ivf|hnsw)\s*\(',
+        indexdef,
+        flags=re.IGNORECASE,
+    )
+    return match.group(1).lower() if match else None
 
 
 @dataclass
@@ -401,8 +561,9 @@ def build_vector_index_ddl(
 ) -> str:
     """CREATE INDEX for a vector inverted index on the embedding column.
 
-    ``vector_opclass`` is the operator-class spec produced by :meth:`IVFIndex.index_options`,
-    e.g. ``ivf (metric = 'cosine', quant = 'sq8')``. ``metadata_entries`` (from
+    ``vector_opclass`` is the operator-class spec produced by
+    :meth:`BaseIndex.index_options`, e.g. ``ivf (metric = 'cosine', quant = 'sq8')`` or
+    ``hnsw (metric = 'cosine', m = 32)``. ``metadata_entries`` (from
     :func:`build_metadata_index_entries`) are appended so metadata filters can be served
     by the index scan.
     """

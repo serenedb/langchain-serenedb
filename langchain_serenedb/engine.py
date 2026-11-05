@@ -553,7 +553,7 @@ class SereneDBEngine:
     ) -> None:
         """Async: create a table for storing vectors.
 
-        Pass ``vector_index`` (e.g. ``IVFIndex(distance_strategy=...)``) to also build
+        Pass ``vector_index`` (``IVFIndex(...)`` or ``HNSWIndex(...)``) to also build
         the ANN index on the embedding column, or ``hybrid_index_config`` to build the
         combined full-text + vector index — both in the same call as table creation.
         ``if_not_exists=True`` makes the call idempotent (create only when absent; keeps
@@ -601,7 +601,7 @@ class SereneDBEngine:
     ) -> None:
         """Sync: create a table for storing vectors.
 
-        Pass ``vector_index`` (e.g. ``IVFIndex(distance_strategy=...)``) to also build
+        Pass ``vector_index`` (``IVFIndex(...)`` or ``HNSWIndex(...)``) to also build
         the ANN index on the embedding column, or ``hybrid_index_config`` to build the
         combined full-text + vector index — both in the same call as table creation.
         ``if_not_exists=True`` makes the call idempotent (create only when absent; keeps

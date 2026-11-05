@@ -19,6 +19,7 @@ SereneDB specifics honored here:
 from __future__ import annotations
 
 import datetime
+import enum
 import json
 import uuid
 from typing import Any, Callable, Iterable, Optional, Sequence, cast
@@ -43,6 +44,7 @@ from .indexes import (
     build_json_field_selector,
     build_metadata_index_entries,
     build_vector_index_ddl,
+    vector_index_type_from_indexdef,
 )
 
 COMPARISONS_TO_NATIVE = {
@@ -91,6 +93,29 @@ PYTHON_TO_SDB_TYPE_MAP = {
     datetime.datetime: "TIMESTAMP",
     datetime.time: "TIME",
 }
+
+
+class _IndexState(enum.Enum):
+    """What the store knows about its collection's vector index.
+
+    The ``IVF`` and ``HNSW`` values equal the matching ``index_type`` strings of the
+    index and query-option classes, so they compare directly.
+    """
+
+    NOT_CHECKED = "not_checked"  # pg_indexes not consulted yet
+    NO_INDEX = "no_index"
+    IVF = "ivf"
+    HNSW = "hnsw"
+    OTHER = "other"  # an index exists, but its vector opclass is not recognised
+
+    @classmethod
+    def for_index_type(cls, index_type: Optional[str]) -> _IndexState:
+        """State for an existing index whose ``index_type`` is given."""
+        if index_type == cls.IVF.value:
+            return cls.IVF
+        if index_type == cls.HNSW.value:
+            return cls.HNSW
+        return cls.OTHER
 
 
 class AsyncSereneDBVectorStore(VectorStore):
@@ -149,10 +174,9 @@ class AsyncSereneDBVectorStore(VectorStore):
         # When False, writes do NOT auto-refresh the inverted index; the caller is
         # responsible for calling refresh_table() to publish them (faster bulk loads).
         self.sync_load = sync_load
-        # Cached result of is_valid_index(): None = not checked yet. Kept in sync by
-        # aapply_vector_index / adrop_vector_index so the dense query need not probe
-        # pg_indexes on every search.
-        self._index_exists: Optional[bool] = None
+        # Cached state of the collection's index. Kept in sync by the index apply/drop
+        # methods so searches need not probe pg_indexes every time.
+        self._index_state = _IndexState.NOT_CHECKED
         # Output-column alias for the computed distance/score. "distance" unless a real
         # column (id/content/embedding/json/metadata) already uses that name, in which
         # case a non-colliding name is chosen so the SELECT has no duplicate output
@@ -176,16 +200,71 @@ class AsyncSereneDBVectorStore(VectorStore):
     def embeddings(self) -> Embeddings:
         return self.embedding_service
 
+    async def _alookup_index(self) -> _IndexState:
+        """Read the state of the collection's index from pg_indexes."""
+        query = (
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE tablename = %(table_name)s AND schemaname = %(schema_name)s "
+            "AND indexname = %(index_name)s;"
+        )
+        rows = await self.engine._afetch(
+            query,
+            {
+                "table_name": self.table_name,
+                "schema_name": self.schema_name,
+                "index_name": self._vector_index_name,
+            },
+        )
+        if len(rows) != 1:
+            return _IndexState.NO_INDEX
+        return _IndexState.for_index_type(
+            vector_index_type_from_indexdef(
+                rows[0]["indexdef"] or "", self.embedding_column
+            )
+        )
+
+    async def _aindex_state(self) -> _IndexState:
+        """Cached state of the collection's index.
+
+        Looked up once, then kept in sync by the index apply/drop methods. An index
+        created or dropped by another process is not seen until a new store is made.
+        """
+        if self._index_state is _IndexState.NOT_CHECKED:
+            self._index_state = await self._alookup_index()
+        return self._index_state
+
     async def _avector_index_available(self) -> bool:
-        """Whether this collection's vector (IVF) index exists (cached).
+        """Whether this collection's vector index exists (cached).
 
         The dense query only uses the index when selecting from it by name, so it needs
-        to know whether the index is there. Determined once via ``is_valid_index`` and
-        then cached; index create/drop update the cache.
+        to know whether the index is there.
         """
-        if self._index_exists is None:
-            self._index_exists = await self.is_valid_index()
-        return self._index_exists
+        return await self._aindex_state() is not _IndexState.NO_INDEX
+
+    async def _aquery_options_prelude(self) -> Optional[list[str]]:
+        """``SET LOCAL`` statements for :attr:`index_query_options`, or ``None``.
+
+        Raises ``ValueError`` when the options are for a different index type than the
+        collection's index (e.g. ``IVFQueryOptions`` on an HNSW index): SereneDB accepts
+        the setting but the index ignores it, so the tuning would silently not apply.
+        """
+        options = self.index_query_options
+        if not options:
+            return None
+        if options.index_type is not None:
+            state = await self._aindex_state()
+            if (
+                state in (_IndexState.IVF, _IndexState.HNSW)
+                and state.value != options.index_type
+            ):
+                actual = state.value.upper()
+                raise ValueError(
+                    f"{type(options).__name__} tunes {options.index_type.upper()} "
+                    f"indexes, but the index of collection '{self.table_name}' "
+                    f"({self._vector_index_name}) is {actual}. Pass query options "
+                    f"for {actual} indexes as index_query_options."
+                )
+        return [f"SET LOCAL {opt};" for opt in options.to_parameter()]
 
     @property
     def _vector_index_name(self) -> str:
@@ -603,11 +682,7 @@ class AsyncSereneDBVectorStore(VectorStore):
         if filter_dict:
             params.update(filter_dict)
 
-        prelude = None
-        if self.index_query_options:
-            prelude = [
-                f"SET LOCAL {opt};" for opt in self.index_query_options.to_parameter()
-            ]
+        prelude = await self._aquery_options_prelude()
         return await self._aquery(query, params, prelude=prelude)
 
     async def _ahybrid_query(
@@ -729,11 +804,7 @@ class AsyncSereneDBVectorStore(VectorStore):
             f"LIMIT %(final_k)s;"
         )
 
-        prelude = None
-        if self.index_query_options:
-            prelude = [
-                f"SET LOCAL {opt};" for opt in self.index_query_options.to_parameter()
-            ]
+        prelude = await self._aquery_options_prelude()
         return await self._aquery(query, params, prelude=prelude)
 
     async def _aquery_collection(
@@ -977,7 +1048,7 @@ class AsyncSereneDBVectorStore(VectorStore):
                 metadata_entries=metadata_entries,
             )
         await self.engine._aexecute(stmt)
-        self._index_exists = True
+        self._index_state = _IndexState.for_index_type(index.index_type)
 
     async def aapply_vector_index(
         self,
@@ -985,10 +1056,12 @@ class AsyncSereneDBVectorStore(VectorStore):
         *,
         concurrently: bool = False,
     ) -> None:
-        """Create the collection's single plain vector (IVF) index on the embedding column.
+        """Create the collection's single plain vector index on the embedding column.
 
-        For the combined full-text + vector index, use
-        :meth:`aapply_hybrid_search_index`.
+        ``index`` is an :class:`~langchain_serenedb.indexes.IVFIndex` or
+        :class:`~langchain_serenedb.indexes.HNSWIndex`. A collection has one index at a
+        time: to change its type, drop it first (:meth:`adrop_vector_index`). For the
+        combined full-text + vector index, use :meth:`aapply_hybrid_search_index`.
         """
         await self._abuild_index(index, index_config=None)
 
@@ -1002,7 +1075,8 @@ class AsyncSereneDBVectorStore(VectorStore):
 
         ``index`` selects the vector-index configuration (defaults to a plain
         :class:`~langchain_serenedb.indexes.IVFIndex`); pass e.g.
-        ``IVFIndex(quant="sq8", ...)`` to build a quantized combined index.
+        ``IVFIndex(quant="sq8", ...)`` to build a quantized combined index, or
+        ``HNSWIndex(...)`` to use an HNSW index for the vector side.
         ``index_config`` (a :class:`~langchain_serenedb.hybrid_search_config.HybridIndexConfig`)
         selects the text search dictionary; it defaults to ``HybridIndexConfig()``.
         """
@@ -1034,24 +1108,10 @@ class AsyncSereneDBVectorStore(VectorStore):
         await self.engine._aexecute(
             f'DROP INDEX IF EXISTS "{self.schema_name}"."{index_name}";'
         )
-        self._index_exists = False
+        self._index_state = _IndexState.NO_INDEX
 
     async def is_valid_index(self) -> bool:
-        index_name = self._vector_index_name
-        query = (
-            "SELECT tablename, indexname FROM pg_indexes "
-            "WHERE tablename = %(table_name)s AND schemaname = %(schema_name)s "
-            "AND indexname = %(index_name)s;"
-        )
-        rows = await self.engine._afetch(
-            query,
-            {
-                "table_name": self.table_name,
-                "schema_name": self.schema_name,
-                "index_name": index_name,
-            },
-        )
-        return len(rows) == 1
+        return await self._alookup_index() is not _IndexState.NO_INDEX
 
     # -- filter translation ----------------------------------------------------------
 
