@@ -122,6 +122,17 @@ def test_hnsw_query_options_to_parameter():
     ]
 
 
+def test_hnsw_filter_options_to_parameter():
+    assert HNSWQueryOptions(
+        filter_mode="scan", column_filter="fold"
+    ).to_parameter() == [
+        "sdb_hnsw_filter_mode = 'scan'",
+        "sdb_hnsw_column_filter = 'fold'",
+    ]
+    with pytest.raises(ValueError, match="Invalid filter_mode"):
+        HNSWQueryOptions(filter_mode="scan'; DROP TABLE x; --")
+
+
 def test_query_options_declare_index_type():
     assert IVFQueryOptions.index_type == "ivf"
     assert HNSWQueryOptions.index_type == "hnsw"
@@ -262,8 +273,13 @@ def test_hnsw_query_options_reach_db(engine, table):
     base.apply_vector_index(HNSWIndex(distance_strategy=L2, quant="sq8"))
 
     for options in (
-        HNSWQueryOptions(ef_search=64, rescore_width=3.0),
+        HNSWQueryOptions(
+            ef_search=64, rescore_width=3.0, filter_mode="walk", column_filter="read"
+        ),
         HNSWQueryOptions(ef_search=-1, rescore_width=0),
+        *(HNSWQueryOptions(filter_mode=m) for m in ("auto", "scan", "prune", "twohop")),
+        HNSWQueryOptions(filter_mode="bridge", column_filter="fold"),
+        HNSWQueryOptions(column_filter="auto"),
     ):
         vs = _store(engine, table, index_query_options=options)
         assert vs.similarity_search("green", k=1)[0].page_content == "green", options
@@ -271,6 +287,8 @@ def test_hnsw_query_options_reach_db(engine, table):
     for options, setting in (
         (HNSWQueryOptions(ef_search=0), "sdb_hnsw_ef_search"),
         (HNSWQueryOptions(rescore_width=-2), "sdb_ann_rescore_width"),
+        (HNSWQueryOptions(filter_mode="bogus"), "sdb_hnsw_filter_mode"),
+        (HNSWQueryOptions(column_filter="bogus"), "sdb_hnsw_column_filter"),
     ):
         vs = _store(engine, table, index_query_options=options)
         with pytest.raises(psycopg.Error) as exc:

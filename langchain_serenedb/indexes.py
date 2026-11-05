@@ -322,6 +322,17 @@ class HNSWQueryOptions(QueryOptions):
     SereneDB choose (the larger of the index's ``ef_construction`` and the query's
     ``k``). ``rescore_width`` applies to a *quantized* index only,
     as ``sdb_ann_rescore_width``, with the same meaning as in :class:`IVFQueryOptions`.
+
+    ``filter_mode`` (``sdb_hnsw_filter_mode``) and ``column_filter``
+    (``sdb_hnsw_column_filter``) choose how a search with a metadata filter is run:
+    every row returned still passes the filter, but speed and, outside the exact
+    ``"scan"``, which near neighbours are found can differ. By default SereneDB picks per segment
+    (``"auto"``). ``filter_mode`` forces how the walk treats rejected rows
+    (``"scan"``, ``"walk"``, ``"prune"``, ``"twohop"`` or ``"bridge"``), and
+    ``column_filter`` whether a filter on an ``INCLUDE``d column is evaluated before the
+    walk (``"fold"``) or per row during it (``"read"``). A forced value applies to every
+    search the store runs.
+
     A field left ``None`` is omitted so SereneDB's own default applies.
     """
 
@@ -329,6 +340,16 @@ class HNSWQueryOptions(QueryOptions):
 
     ef_search: Optional[int] = None
     rescore_width: Optional[float] = None
+    filter_mode: Optional[str] = None
+    column_filter: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        # The values are interpolated into SET LOCAL, so accept bare words only; the
+        # database still decides which words are valid.
+        for name in ("filter_mode", "column_filter"):
+            value = getattr(self, name)
+            if value is not None and not re.fullmatch(r"[A-Za-z_]+", value):
+                raise ValueError(f"Invalid {name}: {value!r}")
 
     def to_parameter(self) -> list[str]:
         """Return ``SET LOCAL`` bodies for the options that were set (empty if none)."""
@@ -337,6 +358,10 @@ class HNSWQueryOptions(QueryOptions):
             params.append(f"sdb_hnsw_ef_search = {self.ef_search}")
         if self.rescore_width is not None:
             params.append(f"sdb_ann_rescore_width = {self.rescore_width}")
+        if self.filter_mode is not None:
+            params.append(f"sdb_hnsw_filter_mode = '{self.filter_mode}'")
+        if self.column_filter is not None:
+            params.append(f"sdb_hnsw_column_filter = '{self.column_filter}'")
         return params
 
     def to_string(self) -> str:
