@@ -238,12 +238,33 @@ class SereneDBEngine:
         )
 
     def _run_as_sync(self, coro: Awaitable[T]) -> T:
-        """Run an async coroutine synchronously."""
+        """Run an async coroutine synchronously on the engine's loop.
+
+        Blocks the calling thread until the coroutine finishes, so it must not be called
+        from the thread running that loop: the loop could then never run the coroutine
+        being waited for. That case raises instead of hanging.
+        """
         if not self._loop:
+            self._discard(coro)
             raise Exception(
                 "Engine was initialized without a background loop and cannot call sync methods."
             )
+        if self._is_running_in_current_thread(self._loop):
+            self._discard(coro)
+            raise RuntimeError(
+                "A synchronous SereneDBEngine/SereneDBVectorStore method was called from "
+                "the event loop the engine runs on; waiting for it there would block "
+                "forever. Await the 'a'-prefixed async method instead (e.g. "
+                "'await engine.ainit_vectorstore_table(...)'), or call the sync method "
+                "from another thread (e.g. via asyncio.to_thread)."
+            )
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result()  # type: ignore[arg-type]
+
+    @staticmethod
+    def _discard(coro: Awaitable[Any]) -> None:
+        """Close a coroutine that will never run, so Python does not warn about it."""
+        if asyncio.iscoroutine(coro):
+            coro.close()
 
     async def _ensure_open(self) -> None:
         """Open the connection pool if needed and check the server version once."""
