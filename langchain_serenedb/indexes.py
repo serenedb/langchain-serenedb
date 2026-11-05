@@ -137,7 +137,7 @@ class QueryOptions(ABC):
 def _quantization_options(
     quant: Optional[str],
     pq_m: Optional[int],
-    nb_bits: Optional[int],
+    nb_bits: Optional[float],
     query_bits: Optional[int],
     compression: Optional[bool],
 ) -> list[str]:
@@ -148,7 +148,8 @@ def _quantization_options(
     if pq_m is not None:
         opts.append(f"pq_m = {pq_m}")
     if nb_bits is not None:
-        opts.append(f"nb_bits = {nb_bits}")
+        # ``:g`` keeps whole values integral (4, not 4.0) and fractional ones as is.
+        opts.append(f"nb_bits = {nb_bits:g}")
     if query_bits is not None:
         opts.append(f"query_bits = {query_bits}")
     if compression is not None:
@@ -173,8 +174,9 @@ class IVFIndex(BaseIndex):
         pq_m: Number of PQ sub-quantizers (must divide the vector dimension); valid only
             with ``quant="pq"``.
         rabitq_bits: Deprecated; use ``nb_bits``. Sent to the server as ``nb_bits``.
-        nb_bits: Bits per stored code for the quantizers that take a bit count
-            (``rabitq``, ``tq``, ``bq``, ``osq``).
+        nb_bits: Bit count for the quantizers that take one: bits per dimension for
+            ``tq``, ``bq`` and ``osq`` (``tq`` and ``bq`` also accept ``1.5``), and the
+            extra magnitude bits for ``rabitq``.
         query_bits: Bits used to quantize the query vector; valid only with
             ``quant="bq"`` or ``quant="osq"``.
         compression: When ``False``, store the index vectors uncompressed (default is
@@ -187,7 +189,7 @@ class IVFIndex(BaseIndex):
     quant: Optional[str] = None
     pq_m: Optional[int] = None
     rabitq_bits: Optional[int] = None
-    nb_bits: Optional[int] = None
+    nb_bits: Optional[float] = None
     query_bits: Optional[int] = None
     compression: Optional[bool] = None
 
@@ -238,7 +240,8 @@ class HNSWIndex(BaseIndex):
         quant: Vector quantization, as for :class:`IVFIndex` (SereneDB default
             ``"sq8"``; the ``l1`` metric supports only ``"none"``).
         pq_m: Number of PQ sub-quantizers; valid only with ``quant="pq"``.
-        nb_bits: Bits per stored code for the quantizers that take a bit count.
+        nb_bits: Bit count for the quantizers that take one, as for
+            :class:`IVFIndex`.
         query_bits: Bits used to quantize the query vector; valid only with
             ``quant="bq"`` or ``quant="osq"``.
         compression: When ``False``, store the index vectors uncompressed.
@@ -251,7 +254,7 @@ class HNSWIndex(BaseIndex):
     ef_construction: Optional[int] = None
     quant: Optional[str] = None
     pq_m: Optional[int] = None
-    nb_bits: Optional[int] = None
+    nb_bits: Optional[float] = None
     query_bits: Optional[int] = None
     compression: Optional[bool] = None
 
@@ -316,7 +319,8 @@ class HNSWQueryOptions(QueryOptions):
 
     ``ef_search`` is the candidate-list size of the graph search (higher = better
     recall, slower), applied as the ``sdb_hnsw_ef_search`` session setting; ``-1`` lets
-    SereneDB size it from ``k``. ``rescore_width`` applies to a *quantized* index only,
+    SereneDB choose (the larger of the index's ``ef_construction`` and the query's
+    ``k``). ``rescore_width`` applies to a *quantized* index only,
     as ``sdb_ann_rescore_width``, with the same meaning as in :class:`IVFQueryOptions`.
     A field left ``None`` is omitted so SereneDB's own default applies.
     """

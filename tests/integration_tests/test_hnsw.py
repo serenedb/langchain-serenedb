@@ -93,6 +93,14 @@ def test_ivf_index_bit_options_string():
     )
 
 
+def test_fractional_nb_bits_string():
+    assert "nb_bits = 1.5" in HNSWIndex(quant="tq", nb_bits=1.5).index_options()
+    assert (
+        "nb_bits = 4,"
+        in IVFIndex(quant="tq", nb_bits=4.0, compression=True).index_options()
+    )
+
+
 def test_ivf_rabitq_bits_is_deprecated_alias_of_nb_bits():
     with pytest.warns(DeprecationWarning, match="use nb_bits instead"):
         index = IVFIndex(distance_strategy=L2, quant="rabitq", rabitq_bits=4)
@@ -309,3 +317,15 @@ def test_switch_ivf_to_hnsw_updates_check(engine, table):
     vs.drop_vector_index()
     vs.apply_vector_index(HNSWIndex(distance_strategy=L2))
     assert vs.similarity_search("green", k=1)[0].page_content == "green"
+
+
+@requires_db
+def test_hybrid_apply_over_existing_index_keeps_its_type(engine, table):
+    """The hybrid DDL is IF NOT EXISTS: the existing index stays, and the store says so."""
+    vs = _store(engine, table, index_query_options=HNSWQueryOptions(ef_search=32))
+    _fill(vs)
+    vs.apply_vector_index(IVFIndex(distance_strategy=L2))
+    vs.apply_hybrid_search_index(index=HNSWIndex(distance_strategy=L2))
+    assert " ivf (" in _index_def(engine, table)
+    with pytest.raises(ValueError, match="is IVF"):
+        vs.similarity_search("green", k=1)

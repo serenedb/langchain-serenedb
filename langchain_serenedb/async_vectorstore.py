@@ -1048,7 +1048,9 @@ class AsyncSereneDBVectorStore(VectorStore):
                 metadata_entries=metadata_entries,
             )
         await self.engine._aexecute(stmt)
-        self._index_state = _IndexState.for_index_type(index.index_type)
+        # Read the result back rather than assuming ``index``: the hybrid DDL is
+        # ``IF NOT EXISTS``, so an existing index (possibly of another type) is kept.
+        self._index_state = await self._alookup_index()
 
     async def aapply_vector_index(
         self,
