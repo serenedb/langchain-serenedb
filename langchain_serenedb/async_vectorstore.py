@@ -10,9 +10,6 @@ SereneDB specifics honored here:
   ``<> ALL(:arr)`` are unsupported ("UNNEST not supported here").
 - JSON filters: extractions are parenthesized — ``(md ->> 'k')``, ``(md ->> 'k')::INT``
   — because ``->`` is a low-precedence operator in SereneDB.
-- Eventual consistency: after writes, ``VACUUM (REFRESH_TABLE)`` publishes rows to the
-  inverted index; ``aadd_embeddings`` / ``adelete`` refresh automatically unless the
-  store was created with ``sync_load=False`` (then the caller owns refreshing).
 - Vector index: ``CREATE INDEX ... USING inverted (emb ivf (metric='cosine', ...))``.
 """
 
@@ -118,7 +115,6 @@ class AsyncSereneDBVectorStore(VectorStore):
         index_query_options: Optional[QueryOptions] = None,
         hybrid_search_config: Optional[HybridSearchConfig] = None,
         metadata_index: Optional[MetadataIndexConfig] = None,
-        sync_load: bool = True,
     ) -> None:
         if key != AsyncSereneDBVectorStore.__create_key:
             raise Exception(
@@ -146,9 +142,6 @@ class AsyncSereneDBVectorStore(VectorStore):
         # inverted index; consulted by the filter translator so a declared JSON field's
         # query expression matches its indexed expression (arrow + cast).
         self.metadata_index = metadata_index
-        # When False, writes do NOT auto-refresh the inverted index; the caller is
-        # responsible for calling refresh_table() to publish them (faster bulk loads).
-        self.sync_load = sync_load
         # Cached result of is_valid_index(): None = not checked yet. Kept in sync by
         # aapply_vector_index / adrop_vector_index so the dense query need not probe
         # pg_indexes on every search.
@@ -261,14 +254,8 @@ class AsyncSereneDBVectorStore(VectorStore):
         index_query_options: Optional[QueryOptions] = None,
         hybrid_search_config: Optional[HybridSearchConfig] = None,
         metadata_index: Optional[MetadataIndexConfig] = None,
-        sync_load: bool = True,
     ) -> AsyncSereneDBVectorStore:
         """Create an ``AsyncSereneDBVectorStore`` bound to an existing table.
-
-        ``sync_load=False`` skips the automatic inverted-index refresh after each
-        write (add/delete), so a bulk load runs faster; the caller then owns calling
-        ``refresh_table()`` before those rows are visible to full-text / vector-index-
-        routed queries.
 
         Validates the requested columns against ``information_schema.columns``. Note
         that SereneDB reports a ``FLOAT[N]`` embedding column with ``data_type =
@@ -352,7 +339,6 @@ class AsyncSereneDBVectorStore(VectorStore):
             index_query_options=index_query_options,
             hybrid_search_config=hybrid_search_config,
             metadata_index=metadata_index,
-            sync_load=sync_load,
         )
 
     # -- low-level query helper ------------------------------------------------------
@@ -386,7 +372,7 @@ class AsyncSereneDBVectorStore(VectorStore):
         ids: Optional[list] = None,
         **kwargs: Any,
     ) -> list[str]:
-        """Add data along with embeddings to the table (upsert), then refresh."""
+        """Add data along with embeddings to the table (upsert)."""
         texts = list(texts)
         if not ids:
             ids = [str(uuid.uuid4()) for _ in texts]
@@ -457,12 +443,6 @@ class AsyncSereneDBVectorStore(VectorStore):
             params_seq.append(values)
 
         await self.engine._aexecute_many(statement, params_seq)
-        # Publish the writes to the inverted index (eventual consistency) unless the
-        # caller opted out via sync_load=False to speed up a bulk load.
-        if self.sync_load:
-            await self.engine._arefresh_table(
-                self.table_name, schema_name=self.schema_name
-            )
         return ids
 
     async def aadd_texts(
@@ -495,7 +475,7 @@ class AsyncSereneDBVectorStore(VectorStore):
         filter: Optional[dict] = None,
         **kwargs: Any,
     ) -> Optional[bool]:
-        """Delete records by ids and/or metadata filter, then refresh."""
+        """Delete records by ids and/or metadata filter."""
         if not ids and not filter:
             return False
 
@@ -515,10 +495,6 @@ class AsyncSereneDBVectorStore(VectorStore):
             f'DELETE FROM "{self.schema_name}"."{self.table_name}" WHERE {where_clause}'
         )
         await self.engine._aexecute(query, param_dict)
-        if self.sync_load:
-            await self.engine._arefresh_table(
-                self.table_name, schema_name=self.schema_name
-            )
         return True
 
     # -- search ----------------------------------------------------------------------

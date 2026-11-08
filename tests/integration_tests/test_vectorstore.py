@@ -904,27 +904,24 @@ def test_relevance_scores_on_hybrid_store(hybrid_store):
     assert scores == sorted(scores, reverse=True)
 
 
-# -- sync_load (deferred inverted-index refresh) ---------------------------------------
+# -- visibility of writes ------------------------------------------------------------
 
 
-def test_sync_load_false_then_manual_refresh():
-    """sync_load=False skips the auto-refresh; a manual refresh publishes the rows.
-
-    We do NOT assert the rows are hidden before the refresh: SereneDB has a background
-    sync that may publish them on its own, so that would be flaky. What is reliable is
-    that an explicit refresh_table() succeeds and the rows are then visible.
-    """
-    table = f"lc_syncload_{uuid.uuid4().hex[:8]}"
+def test_writes_are_searchable_at_once():
+    """Rows an add commits and rows a delete removes show in the next search."""
+    table = f"lc_visible_{uuid.uuid4().hex[:8]}"
     engine = SereneDBEngine.from_connection_string(CONNINFO)
     engine.init_vectorstore_table(
         table, DIM, overwrite_existing=True, vector_index=IVFIndex()
     )
-    vs = SereneDBVectorStore.create_sync(engine, DetEmb(), table, sync_load=False)
+    vs = SereneDBVectorStore.create_sync(engine, DetEmb(), table)
     try:
-        vs.add_texts(["alpha", "beta", "gamma"])
-        engine.refresh_table(table)  # caller publishes explicitly; must not raise
-        after = [d.page_content for d in vs.similarity_search("alpha", k=5)]
-        assert "alpha" in after
+        ids = vs.add_texts(["alpha", "beta", "gamma"])
+        found = [d.page_content for d in vs.similarity_search("alpha", k=5)]
+        assert sorted(found) == ["alpha", "beta", "gamma"]
+        vs.delete(ids=[ids[0]])
+        found = [d.page_content for d in vs.similarity_search("alpha", k=5)]
+        assert sorted(found) == ["beta", "gamma"]
     finally:
         engine.drop_table(table)
         engine.close()
