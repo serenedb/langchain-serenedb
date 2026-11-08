@@ -39,9 +39,6 @@ engine.init_vectorstore_table(table_name="my_docs", vector_size=768)
 engine.init_vectorstore_table("my_docs", 768, vector_index=IVFIndex())
 #   ...or the combined full-text + vector index for hybrid search:
 #   engine.init_vectorstore_table("my_docs", 768, hybrid_search_config=HybridSearchConfig())
-
-# ... after writing rows, publish them to the inverted index:
-engine.refresh_table("my_docs")
 ```
 
 > **Tip:** for a large bulk load, SereneDB trains better IVF clusters if you create the

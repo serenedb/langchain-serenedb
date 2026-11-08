@@ -30,7 +30,7 @@ from .indexes import (
 
 T = TypeVar("T")
 
-MIN_SUPPORTED_SERVER_VERSION: tuple[int, ...] = (26, 11, 2)
+MIN_SUPPORTED_SERVER_VERSION: tuple[int, ...] = (26, 11, 3)
 """Oldest SereneDB server release this package supports."""
 
 # ``SELECT version()`` reports e.g. ``PostgreSQL 18.3 (SereneDB 26.11.2)``; the
@@ -619,34 +619,4 @@ class SereneDBEngine:
     def drop_table(self, table_name: str, *, schema_name: str = "public") -> None:
         self._run_as_sync(
             self._adrop_table(table_name=table_name, schema_name=schema_name)
-        )
-
-    # -- inverted-index refresh (eventual consistency) -------------------------------
-
-    async def _arefresh_table(
-        self, table_name: str, *, schema_name: str = "public"
-    ) -> None:
-        """Publish buffered writes to the inverted index so new rows are searchable.
-
-        SereneDB's inverted index is eventually consistent: rows written since the last
-        refresh are invisible to full-text and vector-index-routed queries until
-        refreshed. Call
-        this after ``add_texts``/``delete`` when the table has an inverted index.
-        """
-        schema_name = self._escape_identifier(schema_name)
-        table_name = self._escape_identifier(table_name)
-        await self._aexecute_autocommit(
-            f'VACUUM (REFRESH_TABLE) "{schema_name}"."{table_name}";'
-        )
-
-    async def arefresh_table(
-        self, table_name: str, *, schema_name: str = "public"
-    ) -> None:
-        await self._run_as_async(
-            self._arefresh_table(table_name=table_name, schema_name=schema_name)
-        )
-
-    def refresh_table(self, table_name: str, *, schema_name: str = "public") -> None:
-        self._run_as_sync(
-            self._arefresh_table(table_name=table_name, schema_name=schema_name)
         )
