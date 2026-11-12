@@ -322,39 +322,61 @@ def test_ivf_query_options_to_parameter():
     """IVFQueryOptions emits SET LOCAL bodies only for the fields that are set."""
     assert IVFQueryOptions().to_parameter() == []
     assert IVFQueryOptions(nprobe=10).to_parameter() == ["sdb_ivf_search_nprobe = 10"]
-    assert IVFQueryOptions(nprobe=10, rerank_factor=4).to_parameter() == [
+    assert IVFQueryOptions(rescore_width=0).to_parameter() == [
+        "sdb_ann_rescore_width = 0"
+    ]
+    assert IVFQueryOptions(nprobe=10, rescore_width=2.5).to_parameter() == [
         "sdb_ivf_search_nprobe = 10",
-        "sdb_rerank_factor = 4",
+        "sdb_ann_rescore_width = 2.5",
     ]
 
 
-def test_ivf_query_options_nprobe_reaches_db():
-    """IVFQueryOptions is actually applied to the query as a SET LOCAL prelude.
+def test_ivf_query_options_reach_db():
+    """Every IVFQueryOptions setting is accepted by the server and applied per query.
 
-    Proven behaviorally: a valid nprobe searches fine, while nprobe=0 (which SereneDB
-    rejects -- sdb_ivf_search_nprobe must be >= 1) makes the search raise. That error can
-    only occur if the ``SET LOCAL sdb_ivf_search_nprobe`` prelude genuinely reached the
-    database.
+    The options are sent as a SET LOCAL prelude before each search. A search with all of
+    them set succeeds only if the server recognizes every setting name (an unknown one
+    raises "unrecognized configuration parameter"). An out-of-range value for each
+    setting then makes the search raise "invalid value for parameter", which can only
+    happen if that setting's prelude reached the database.
     """
-    table = f"lc_ivfnp_{uuid.uuid4().hex[:8]}"
+    table = f"lc_ivfqo_{uuid.uuid4().hex[:8]}"
     engine = SereneDBEngine.from_connection_string(CONNINFO)
-    engine.init_vectorstore_table(
-        table, DIM, overwrite_existing=True, vector_index=IVFIndex()
+    engine.init_vectorstore_table(table, DIM, overwrite_existing=True)
+    # rescore_width only matters on a quantized index (sq8 requires l2/ip).
+    base = SereneDBVectorStore.create_sync(
+        engine, DetEmb(), table, distance_strategy=DistanceStrategy.EUCLIDEAN
     )
-    try:
-        ok = SereneDBVectorStore.create_sync(
-            engine, DetEmb(), table, index_query_options=IVFQueryOptions(nprobe=10)
-        )
-        ok.add_texts(["red", "green", "blue"])
-        assert ok.similarity_search("green", k=1)[0].page_content == "green"
+    base.add_texts(["red", "green", "blue", "cyan", "magenta", "yellow"])
+    base.apply_vector_index(
+        IVFIndex(distance_strategy=DistanceStrategy.EUCLIDEAN, quant="sq8")
+    )
 
-        # A rejected nprobe value must surface -- only possible if the prelude is issued.
-        bad = SereneDBVectorStore.create_sync(
-            engine, DetEmb(), table, index_query_options=IVFQueryOptions(nprobe=0)
+    def store_with(options: IVFQueryOptions) -> SereneDBVectorStore:
+        return SereneDBVectorStore.create_sync(
+            engine,
+            DetEmb(),
+            table,
+            distance_strategy=DistanceStrategy.EUCLIDEAN,
+            index_query_options=options,
         )
-        with pytest.raises(Exception) as exc:
-            bad.similarity_search("green", k=1)
-        assert "sdb_ivf_search_nprobe" in str(exc.value)
+
+    try:
+        for options in (
+            IVFQueryOptions(nprobe=10, rescore_width=3.0),
+            IVFQueryOptions(rescore_width=0),
+            IVFQueryOptions(rescore_width=-1),
+        ):
+            res = store_with(options).similarity_search("green", k=1)
+            assert res[0].page_content == "green", options
+
+        for options, setting in (
+            (IVFQueryOptions(nprobe=0), "sdb_ivf_search_nprobe"),
+            (IVFQueryOptions(rescore_width=-2), "sdb_ann_rescore_width"),
+        ):
+            with pytest.raises(psycopg.Error) as exc:
+                store_with(options).similarity_search("green", k=1)
+            assert f'invalid value for parameter "{setting}"' in str(exc.value)
     finally:
         engine.drop_table(table)
         engine.close()

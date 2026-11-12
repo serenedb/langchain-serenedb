@@ -238,12 +238,33 @@ class SereneDBEngine:
         )
 
     def _run_as_sync(self, coro: Awaitable[T]) -> T:
-        """Run an async coroutine synchronously."""
+        """Run an async coroutine synchronously on the engine's loop.
+
+        Blocks the calling thread until the coroutine finishes, so it must not be called
+        from the thread running that loop: the loop could then never run the coroutine
+        being waited for. That case raises instead of hanging.
+        """
         if not self._loop:
+            self._discard(coro)
             raise Exception(
                 "Engine was initialized without a background loop and cannot call sync methods."
             )
+        if self._is_running_in_current_thread(self._loop):
+            self._discard(coro)
+            raise RuntimeError(
+                "A synchronous SereneDBEngine/SereneDBVectorStore method was called from "
+                "the event loop the engine runs on; waiting for it there would block "
+                "forever. Await the 'a'-prefixed async method instead (e.g. "
+                "'await engine.ainit_vectorstore_table(...)'), or call the sync method "
+                "from another thread (e.g. via asyncio.to_thread)."
+            )
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result()  # type: ignore[arg-type]
+
+    @staticmethod
+    def _discard(coro: Awaitable[Any]) -> None:
+        """Close a coroutine that will never run, so Python does not warn about it."""
+        if asyncio.iscoroutine(coro):
+            coro.close()
 
     async def _ensure_open(self) -> None:
         """Open the connection pool if needed and check the server version once."""
@@ -338,8 +359,14 @@ class SereneDBEngine:
         """Execute a statement that cannot run inside a transaction (e.g. VACUUM)."""
         await self._ensure_open()
         async with self._pool.connection() as conn:
+            previous = conn.autocommit
             await conn.set_autocommit(True)
-            await conn.execute(query)
+            try:
+                await conn.execute(query)
+            finally:
+                # The connection goes back to the pool; leaving it in autocommit would
+                # make a later SET LOCAL on it run outside any transaction.
+                await conn.set_autocommit(previous)
 
     @staticmethod
     def _escape_identifier(name: str) -> str:
@@ -526,7 +553,7 @@ class SereneDBEngine:
     ) -> None:
         """Async: create a table for storing vectors.
 
-        Pass ``vector_index`` (e.g. ``IVFIndex(distance_strategy=...)``) to also build
+        Pass ``vector_index`` (``IVFIndex(...)`` or ``HNSWIndex(...)``) to also build
         the ANN index on the embedding column, or ``hybrid_index_config`` to build the
         combined full-text + vector index — both in the same call as table creation.
         ``if_not_exists=True`` makes the call idempotent (create only when absent; keeps
@@ -574,7 +601,7 @@ class SereneDBEngine:
     ) -> None:
         """Sync: create a table for storing vectors.
 
-        Pass ``vector_index`` (e.g. ``IVFIndex(distance_strategy=...)``) to also build
+        Pass ``vector_index`` (``IVFIndex(...)`` or ``HNSWIndex(...)``) to also build
         the ANN index on the embedding column, or ``hybrid_index_config`` to build the
         combined full-text + vector index — both in the same call as table creation.
         ``if_not_exists=True`` makes the call idempotent (create only when absent; keeps
